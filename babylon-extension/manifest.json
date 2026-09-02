@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Babylon Stock Market Sync",
+  "version": "1.0.8",
+  "description": "Links your Capital Rift companies to your Babylon Stock Market broker account and keeps their valuation data in sync.",
+  "permissions": ["storage", "cookies"],
+  "host_permissions": [
+    "https://play.capitalrift.com/*",
+    "https://holdings.thebabylon.hu/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "scripts": ["src/background.js"],
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://play.capitalrift.com/*"],
+      "js": ["src/content-script.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://holdings.thebabylon.hu/*"],
+      "js": ["src/babylon-marker.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/page-inject.js"],
+      "matches": ["https://play.capitalrift.com/*"]
+    }
+  ],
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "Babylon Stock Market"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "babylon-stock-sync@thebabylon.hu",
+      "strict_min_version": "109.0"
+    }
+  }
+}

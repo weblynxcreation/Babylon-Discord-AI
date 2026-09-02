@@ -1,0 +1,28 @@
+# Secrets and local configuration
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python environments and caches
+**/venv/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Runtime state and generated artifacts
+**/data/
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.zip
+
+# Hosting and editor state
+.vercel/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
