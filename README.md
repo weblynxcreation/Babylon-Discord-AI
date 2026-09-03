@@ -17,6 +17,9 @@ powered by your NVIDIA NIM API key.
 - **Web scraping**: give it a URL and it'll fetch and read the actual page
   content (not just a search snippet) — reads text or pulls out links,
   respects `robots.txt`, and skips anything behind a login or paywall
+- **Obsidian vault search** (optional): if you set `OBSIDIAN_VAULT_PATH` in `.env`,
+  the bot can search and read your local Obsidian notes. Just ask it questions
+  and it'll automatically find answers from your vault. Example: *"How many foundries do I need to smelt 1000 iron bars per minute?"*
 - **Automod**: filters banned words, mass mentions, invite-link spam, and
   message-rate spam in real time, with escalating enforcement (delete →
   warn → 10-minute timeout for repeat offenders)
@@ -28,9 +31,9 @@ powered by your NVIDIA NIM API key.
 - **Raid protection**: detects join bursts and, once triggered, auto-kicks
   (or bans, or just alerts — configurable) new accounts below a minimum age
   until a moderator clears it
-- Automatically decides *when* to search, scrape, generate images/GIFs, or
-  write code — you don't need separate commands for the chat flow, only
-  mention it.
+- Automatically decides *when* to search the web, scrape URLs, search Obsidian,
+  generate images/GIFs, or write code — you don't need separate commands for
+  the chat flow, only mention it.
 
 ## 1. Create the Discord application
 
@@ -53,6 +56,24 @@ powered by your NVIDIA NIM API key.
   for feeding search results to LLM agents, works better than raw scraping
 - Image gen uses the same NVIDIA key by default (NIM-hosted Stable Diffusion 3).
   `STABILITY_API_KEY` in `.env` is optional — only needed as a fallback.
+
+## 2a. Optional: Obsidian Vault Integration
+
+If you have an Obsidian vault with personal knowledge (game guides, wiki notes, worldbuilding, etc.),
+the bot can search and read from it automatically when answering questions.
+
+1. In `.env`, set `OBSIDIAN_VAULT_PATH` to your vault's root directory:
+   ```
+   OBSIDIAN_VAULT_PATH=C:\Users\yourname\OneDrive\Documents\Obsidian Vault\YourVaultName
+   ```
+   
+   Or for Linux/Mac:
+   ```
+   OBSIDIAN_VAULT_PATH=/Users/yourname/Obsidian Vaults/YourVaultName
+   ```
+
+2. That's it. The bot now uses `obsidian_search` first for questions about topics in your vault,
+   then falls back to the live web if needed. It searches all `.md` files recursively.
 
 ## 3. Local setup
 
@@ -218,7 +239,6 @@ with unless you extend it to.
   still frames independently and stitching them — motion won't be perfectly
   coherent between frames. If a proper free-hosted text-to-video/GIF model
   becomes available on NIM, swap the implementation in `tools/gif_gen.py`.
-
 
 ## Integrated Babylon features
 

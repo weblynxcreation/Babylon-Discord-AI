@@ -132,9 +132,12 @@ def _get_wiki_index() -> ObsidianVaultIndex:
     if _WIKI_INDEX is not None:
         return _WIKI_INDEX
 
-    vault_path = os.environ.get("CAPITAL_RIFT_VAULT_PATH", "").strip()
+    vault_path = (
+        os.environ.get("CAPITAL_RIFT_VAULT_PATH", "").strip()
+        or os.environ.get("OBSIDIAN_VAULT_PATH", "").strip()
+    )
     if not vault_path:
-        raise VaultError("CAPITAL_RIFT_VAULT_PATH is not configured on the bot host.")
+        raise VaultError("CAPITAL_RIFT_VAULT_PATH (or legacy OBSIDIAN_VAULT_PATH) is not configured on the bot host.")
 
     default_index = Path(__file__).resolve().parent.parent / "data" / "capital_rift_wiki.db"
     index_path = os.environ.get("CAPITAL_RIFT_INDEX_PATH", "").strip() or str(default_index)
