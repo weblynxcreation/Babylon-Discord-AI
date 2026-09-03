@@ -14,6 +14,8 @@ import os
 import io
 import json
 import logging
+import math
+import re
 from datetime import timedelta
 
 import discord
@@ -663,6 +665,152 @@ async def wiki_status(interaction: discord.Interaction):
         ),
         ephemeral=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Capital Rift direct wiki commands (no AI tool-calling required)
+# ---------------------------------------------------------------------------
+
+def _wiki_embed(title: str, note: dict, *, color: discord.Color) -> discord.Embed:
+    """Render a vault note safely inside Discord's embed limits."""
+    source = note.get("path", "Unknown wiki note")
+    body = (note.get("content") or "").strip()
+    if len(body) > 3900:
+        body = body[:3897].rstrip() + "…"
+    embed = discord.Embed(
+        title=title[:256],
+        description=body or "This wiki note has no readable content.",
+        color=color,
+    )
+    embed.set_footer(text=f"Capital Rift wiki · Source: {source}")
+    return embed
+
+
+async def _capital_rift_note(query: str, kind: str) -> tuple[dict | None, str | None]:
+    """Search then read the strongest local-wiki match for a typed lookup."""
+    payload = json.loads(await capital_rift_wiki("search", query=f"{query} {kind}", limit=5))
+    data = payload.get("data", {})
+    if data.get("error"):
+        return None, data["error"]
+    results = data.get("results") or []
+    if not results:
+        return None, f"No {kind} matching '{query[:100]}' was found in the Capital Rift wiki."
+
+    normalized_query = query.casefold().strip()
+    result = next(
+        (
+            item for item in results
+            if item.get("title", "").casefold().strip() == normalized_query
+            or item.get("path", "").rsplit("/", 1)[-1].removesuffix(".md").casefold() == normalized_query
+        ),
+        results[0],
+    )
+    payload = json.loads(await capital_rift_wiki("read", note_path=result["path"]))
+    data = payload.get("data", {})
+    if data.get("error"):
+        return None, data["error"]
+    return data, None
+
+
+def _per_minute_rate(note: str) -> float | None:
+    """Read an explicit output/recipe rate from common wiki Markdown formats."""
+    patterns = (
+        r"(?:recipe|output|production)\s*rate\s*[:|]\s*[* ]*([0-9]+(?:\.[0-9]+)?)\s*(?:/|\bper\s+)m(?:in(?:ute)?)?\b",
+        r"([0-9]+(?:\.[0-9]+)?)\s*(?:/|\bper\s+)m(?:in(?:ute)?)?\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, note, flags=re.IGNORECASE)
+        if match:
+            rate = float(match.group(1))
+            if rate > 0:
+                return rate
+    return None
+
+
+def _machine_name(note: str) -> str | None:
+    match = re.search(
+        r"(?:machine|building|produced\s+by)\s*[:|]\s*[* ]*([^\n|*]+)",
+        note,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip(" .:-") if match else None
+
+
+@tree.command(name="item", description="Look up a Capital Rift item in the local wiki.")
+@app_commands.describe(name="Item name, for example Iron Plate")
+async def item_lookup(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(thinking=True)
+    note, error = await _capital_rift_note(name, "item")
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    await interaction.followup.send(
+        embed=_wiki_embed(f"Item · {note.get('title', name)}", note, color=discord.Color.blue())
+    )
+
+
+@tree.command(name="recipe", description="Look up a Capital Rift recipe in the local wiki.")
+@app_commands.describe(name="Recipe or output item name, for example Iron Plate")
+async def recipe_lookup(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(thinking=True)
+    note, error = await _capital_rift_note(name, "recipe")
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    await interaction.followup.send(
+        embed=_wiki_embed(f"Recipe · {note.get('title', name)}", note, color=discord.Color.orange())
+    )
+
+
+@tree.command(name="machine", description="Look up a Capital Rift production machine in the local wiki.")
+@app_commands.describe(name="Machine name, for example Furnace")
+async def machine_lookup(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(thinking=True)
+    note, error = await _capital_rift_note(name, "machine")
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    await interaction.followup.send(
+        embed=_wiki_embed(f"Machine · {note.get('title', name)}", note, color=discord.Color.purple())
+    )
+
+
+@tree.command(name="production", description="Calculate machines required for a Capital Rift output target.")
+@app_commands.describe(
+    item="Output item or recipe name, for example Iron Plate",
+    target_per_minute="Desired output per minute",
+)
+async def production(interaction: discord.Interaction, item: str, target_per_minute: app_commands.Range[float, 0.001, 1000000]):
+    await interaction.response.defer(thinking=True)
+    note, error = await _capital_rift_note(item, "recipe")
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    rate = _per_minute_rate(note.get("content", ""))
+    if rate is None:
+        await interaction.followup.send(
+            "I found the recipe, but its wiki note does not contain an explicit per-minute output rate, "
+            f"so I will not guess the machine count. Source: {note.get('path', 'unknown')}",
+            ephemeral=True,
+        )
+        return
+
+    machines = int(math.ceil(float(target_per_minute) / rate))
+    machine = _machine_name(note.get("content", "")) or "the recipe machine"
+    actual_output = machines * rate
+    embed = discord.Embed(
+        title=f"Production plan · {note.get('title', item)}",
+        description=(
+            f"Target: **{float(target_per_minute):g}/min**\n"
+            f"Recipe rate: **{rate:g}/min per machine**\n"
+            f"Machines needed: **{machines:,} {machine}**\n"
+            f"Output at full capacity: **{actual_output:g}/min**"
+        ),
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=f"Capital Rift wiki · Source: {note.get('path', 'unknown')}")
+    await interaction.followup.send(embed=embed)
 
 
 @tree.error
