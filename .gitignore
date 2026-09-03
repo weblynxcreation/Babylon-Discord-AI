@@ -1,4 +1,4 @@
-﻿venv/
+venv/
 __pycache__/
 .env
 .env.*
@@ -24,3 +24,10 @@ var/
 .idea/
 .vscode/
 .DS_Store
+
+# Runtime state and local knowledge indexes
+data/
+Babylonbot/data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

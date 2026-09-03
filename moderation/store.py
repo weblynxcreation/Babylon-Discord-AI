@@ -1,17 +1,21 @@
 """
-Per-guild moderation configuration, persisted to a local JSON file so
-settings survive bot restarts. No database server needed — this is small,
-low-write-volume data (config + warning counts), so a JSON file with an
-asyncio lock is plenty.
+Per-guild bot configuration, persisted to a local JSON file so settings
+survive bot restarts. This covers server administration, moderation settings,
+and warning counts. The file is written atomically to avoid leaving partial
+JSON behind if the process stops during a save.
 """
+import asyncio
 import json
 import os
-import asyncio
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 CONFIG_PATH = os.path.join(DATA_DIR, "moderation_config.json")
 
 DEFAULT_GUILD_CONFIG = {
+    "setup_complete": False,
+    "admin_role_id": None,
+    "market_channel_id": None,
+    "market_alerts_enabled": False,
     "automod_enabled": True,
     "banned_words": [],
     "max_mentions": 5,
@@ -34,20 +38,34 @@ _lock = asyncio.Lock()
 _cache: dict = {}
 
 
-def _load():
+def _default_config() -> dict:
+    """Return an independent copy so nested settings never leak between guilds."""
+    return json.loads(json.dumps(DEFAULT_GUILD_CONFIG))
+
+
+def _load() -> None:
     global _cache
     os.makedirs(DATA_DIR, exist_ok=True)
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            _cache = json.load(f)
-    else:
+    if not os.path.exists(CONFIG_PATH):
         _cache = {}
+        return
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Guild configuration at {CONFIG_PATH} must contain a JSON object.")
+    _cache = loaded
 
 
-def _save():
+def _save() -> None:
+    """Atomically replace the config file after the complete JSON is on disk."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    temporary_path = f"{CONFIG_PATH}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as f:
         json.dump(_cache, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary_path, CONFIG_PATH)
 
 
 _load()
@@ -57,29 +75,51 @@ async def get_guild_config(guild_id: int) -> dict:
     async with _lock:
         key = str(guild_id)
         if key not in _cache:
-            _cache[key] = json.loads(json.dumps(DEFAULT_GUILD_CONFIG))
+            _cache[key] = _default_config()
             _save()
-        # Backfill any new default keys for guilds configured before an update
-        merged = json.loads(json.dumps(DEFAULT_GUILD_CONFIG))
+
+        # Backfill new defaults for guilds configured before an update.
+        merged = _default_config()
         merged.update(_cache[key])
         return merged
 
 
 async def update_guild_config(guild_id: int, **kwargs) -> dict:
+    unknown = set(kwargs) - set(DEFAULT_GUILD_CONFIG)
+    if unknown:
+        raise ValueError(f"Unknown guild configuration keys: {', '.join(sorted(unknown))}")
+
     async with _lock:
         key = str(guild_id)
         if key not in _cache:
-            _cache[key] = json.loads(json.dumps(DEFAULT_GUILD_CONFIG))
+            _cache[key] = _default_config()
         _cache[key].update(kwargs)
         _save()
-        return dict(_cache[key])
+
+        merged = _default_config()
+        merged.update(_cache[key])
+        return merged
+
+
+async def reset_guild_config(guild_id: int, *, preserve_warnings: bool = True) -> dict:
+    """Reset one server without silently erasing its moderation warning history."""
+    async with _lock:
+        key = str(guild_id)
+        warnings = {}
+        if preserve_warnings:
+            warnings = dict(_cache.get(key, {}).get("warnings", {}))
+
+        _cache[key] = _default_config()
+        _cache[key]["warnings"] = warnings
+        _save()
+        return _default_config() | {"warnings": warnings}
 
 
 async def add_warning(guild_id: int, user_id: int) -> int:
     async with _lock:
         key = str(guild_id)
         if key not in _cache:
-            _cache[key] = json.loads(json.dumps(DEFAULT_GUILD_CONFIG))
+            _cache[key] = _default_config()
         warnings = _cache[key].setdefault("warnings", {})
         warnings[str(user_id)] = warnings.get(str(user_id), 0) + 1
         _save()
