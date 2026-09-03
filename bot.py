@@ -12,6 +12,7 @@ Run: python bot.py
 """
 import os
 import io
+import json
 import logging
 from datetime import timedelta
 
@@ -22,6 +23,17 @@ from dotenv import load_dotenv
 from agent import run_agent
 from moderation import store as mod_store, automod, ai_mod, raid
 from storage import chat_history
+from tools.capital_rift import capital_rift_wiki
+from babylon_market import (
+    BabylonAPIError,
+    BabylonMarketClient,
+    calculate_market_status,
+    company_suggestions,
+    find_company,
+    format_currency,
+    format_percent,
+    rank_companies,
+)
 
 load_dotenv()
 
@@ -29,7 +41,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("discord-ai-agent")
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "20"))
+BABYLON_API_BASE = os.environ.get("BABYLON_API_BASE", "https://holdings.thebabylon.hu/api/v1")
+BABYLON_SITE_BASE = os.environ.get("BABYLON_SITE_BASE", "https://holdings.thebabylon.hu").rstrip("/")
+BABYLON_CACHE_SECONDS = float(os.environ.get("BABYLON_CACHE_SECONDS", "30"))
+BABYLON_FRESH_AFTER_MINUTES = int(os.environ.get("BABYLON_FRESH_AFTER_MINUTES", "60"))
+BABYLON_OUTDATED_AFTER_HOURS = int(os.environ.get("BABYLON_OUTDATED_AFTER_HOURS", "24"))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -37,6 +55,11 @@ intents.members = True  # required for join events (raid protection) and member 
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+market_client = BabylonMarketClient(
+    BABYLON_API_BASE,
+    timeout_seconds=float(os.environ.get("BABYLON_HTTP_TIMEOUT_SECONDS", "10")),
+    cache_seconds=BABYLON_CACHE_SECONDS,
+)
 
 DISCORD_FILE_SIZE_LIMIT = 8 * 1024 * 1024  # 8MB default (non-boosted) server limit
 
@@ -82,7 +105,21 @@ async def _mod_log(guild: discord.Guild, text: str) -> None:
 
 @client.event
 async def on_ready():
-    await tree.sync()
+    if DISCORD_GUILD_ID:
+        try:
+            development_guild = discord.Object(id=int(DISCORD_GUILD_ID))
+        except ValueError:
+            raise RuntimeError("DISCORD_GUILD_ID must be a numeric Discord server ID.")
+        tree.copy_global_to(guild=development_guild)
+        synced = await tree.sync(guild=development_guild)
+        log.info(
+            "Synced %s slash commands to development guild %s",
+            len(synced),
+            DISCORD_GUILD_ID,
+        )
+    else:
+        synced = await tree.sync()
+        log.info("Synced %s global slash commands", len(synced))
     log.info(f"Logged in as {client.user} (id={client.user.id})")
 
 
@@ -160,6 +197,225 @@ async def ask(interaction: discord.Interaction, question: str):
     await _send_agent_result(interaction, result, followup=True)
 
 
+# ---------------------------------------------------------------------------
+# Babylon Stock Market commands (public, read-only)
+# ---------------------------------------------------------------------------
+
+async def _market_companies(interaction: discord.Interaction):
+    try:
+        return await market_client.get_companies()
+    except BabylonAPIError as exc:
+        log.warning("Babylon market request failed: %s", exc)
+        await interaction.followup.send(f"Market data is unavailable: {exc}", ephemeral=True)
+        return None
+
+
+def _company_url(company_id: str) -> str:
+    return f"{BABYLON_SITE_BASE}/companies/{company_id}"
+
+
+@tree.command(name="market", description="Show a live overview of the Babylon Stock Market.")
+async def market(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    companies = await _market_companies(interaction)
+    if companies is None:
+        return
+    if not companies:
+        await interaction.followup.send("The Babylon market currently has no listed companies.")
+        return
+
+    leaders = rank_companies(companies, "value")[:5]
+    total_cap = sum(company.total_value for company in companies)
+    verified = sum(company.verified for company in companies)
+    lines = [
+        f"**{index}. [{company.name}]({_company_url(company.id)})** — "
+        f"{format_currency(company.total_value)} · {format_percent(company.trend_pct)}"
+        for index, company in enumerate(leaders, start=1)
+    ]
+    embed = discord.Embed(
+        title="Babylon Stock Market",
+        url=BABYLON_SITE_BASE,
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Listed companies", value=f"{len(companies):,}")
+    embed.add_field(name="Combined value", value=format_currency(total_cap))
+    embed.add_field(name="Verified", value=f"{verified:,}/{len(companies):,}")
+    embed.set_footer(text=f"Public market data · cached for up to {BABYLON_CACHE_SECONDS:g} seconds")
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="stock", description="Look up a company on the Babylon Stock Market.")
+@app_commands.describe(company="Company name")
+async def stock(interaction: discord.Interaction, company: str):
+    await interaction.response.defer(thinking=True)
+    companies = await _market_companies(interaction)
+    if companies is None:
+        return
+    match = find_company(companies, company)
+    if match is None:
+        await interaction.followup.send(
+            f"I couldn't find a listed company matching `{company[:100]}`.", ephemeral=True
+        )
+        return
+
+    color = discord.Color.green() if match.trend_pct >= 0 else discord.Color.red()
+    embed = discord.Embed(
+        title=match.name,
+        url=_company_url(match.id),
+        description="Verified Capital Rift company" if match.verified else "Unverified company",
+        color=color,
+    )
+    embed.add_field(name="Share price", value=format_currency(match.share_price))
+    embed.add_field(name="Trend", value=format_percent(match.trend_pct))
+    embed.add_field(name="Total value", value=format_currency(match.total_value))
+    embed.add_field(name="Net worth", value=format_currency(match.net_worth))
+    embed.add_field(name="Profit/min", value=format_currency(match.profit_per_min))
+    embed.add_field(name="Funded capital", value=format_currency(match.funded_capital))
+    if match.last_synced_at:
+        embed.add_field(
+            name="Last synchronized",
+            value=f"<t:{int(match.last_synced_at.timestamp())}:R>",
+            inline=False,
+        )
+    await interaction.followup.send(embed=embed)
+
+
+@stock.autocomplete("company")
+async def stock_autocomplete(
+    _interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    try:
+        companies = await market_client.get_companies()
+    except BabylonAPIError:
+        return []
+    return [
+        app_commands.Choice(name=company.name[:100], value=company.name[:100])
+        for company in company_suggestions(companies, current)
+    ]
+
+
+@tree.command(name="leaders", description="Rank Babylon companies by market value, price, or profit.")
+@app_commands.describe(metric="Ranking metric", limit="Number of companies to show")
+@app_commands.choices(
+    metric=[
+        app_commands.Choice(name="Total value", value="value"),
+        app_commands.Choice(name="Share price", value="price"),
+        app_commands.Choice(name="Profit per minute", value="profit"),
+    ]
+)
+async def leaders(
+    interaction: discord.Interaction,
+    metric: app_commands.Choice[str],
+    limit: app_commands.Range[int, 3, 10] = 5,
+):
+    await interaction.response.defer(thinking=True)
+    companies = await _market_companies(interaction)
+    if companies is None:
+        return
+    ranked = rank_companies(companies, metric.value)[:limit]
+    value_for = {
+        "value": lambda item: item.total_value,
+        "price": lambda item: item.share_price,
+        "profit": lambda item: item.profit_per_min,
+    }[metric.value]
+    lines = [
+        f"**{index}. [{company.name}]({_company_url(company.id)})** — "
+        f"{format_currency(value_for(company))}"
+        for index, company in enumerate(ranked, start=1)
+    ]
+    embed = discord.Embed(
+        title=f"Market leaders · {metric.name}",
+        description="\n".join(lines) or "No companies are currently listed.",
+        color=discord.Color.gold(),
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="movers", description="Show the Babylon market's biggest gains and losses.")
+@app_commands.describe(limit="Number of gainers and losers to show")
+async def movers(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 1, 10] = 5,
+):
+    await interaction.response.defer(thinking=True)
+    companies = await _market_companies(interaction)
+    if companies is None:
+        return
+    gainers = sorted(
+        (company for company in companies if company.trend_pct > 0),
+        key=lambda company: company.trend_pct,
+        reverse=True,
+    )[:limit]
+    losers = sorted(
+        (company for company in companies if company.trend_pct < 0),
+        key=lambda company: company.trend_pct,
+    )[:limit]
+
+    def mover_lines(items):
+        return "\n".join(
+            f"[{company.name}]({_company_url(company.id)}) — {format_percent(company.trend_pct)}"
+            for company in items
+        ) or "None"
+
+    embed = discord.Embed(title="Market movers", color=discord.Color.gold())
+    embed.add_field(name="Gainers", value=mover_lines(gainers), inline=False)
+    embed.add_field(name="Losers", value=mover_lines(losers), inline=False)
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="market-status", description="Check verification and synchronization health.")
+async def market_status(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    companies = await _market_companies(interaction)
+    if companies is None:
+        return
+    status = calculate_market_status(
+        companies,
+        fresh_after=timedelta(minutes=BABYLON_FRESH_AFTER_MINUTES),
+        outdated_after=timedelta(hours=BABYLON_OUTDATED_AFTER_HOURS),
+    )
+    healthy = (
+        status.total > 0
+        and status.verified == status.total
+        and status.outdated == 0
+        and status.missing_sync_time == 0
+    )
+    embed = discord.Embed(
+        title="Babylon market status",
+        description=(
+            "Market API online. All listed company snapshots are current."
+            if healthy
+            else "Market API online. Some company snapshots have not recently refreshed."
+        ),
+        color=discord.Color.green() if healthy else discord.Color.orange(),
+    )
+    embed.add_field(name="Verified", value=f"{status.verified:,}/{status.total:,}")
+    embed.add_field(
+        name=f"Fresh (≤{BABYLON_FRESH_AFTER_MINUTES}m)", value=f"{status.fresh:,}"
+    )
+    embed.add_field(
+        name=f"Delayed (≤{BABYLON_OUTDATED_AFTER_HOURS}h)", value=f"{status.delayed:,}"
+    )
+    embed.add_field(
+        name=f"Outdated (>{BABYLON_OUTDATED_AFTER_HOURS}h)", value=f"{status.outdated:,}"
+    )
+    embed.add_field(name="Missing sync time", value=f"{status.missing_sync_time:,}")
+    if status.newest_sync:
+        embed.add_field(
+            name="Newest synchronization",
+            value=f"<t:{int(status.newest_sync.timestamp())}:R>",
+            inline=False,
+        )
+    if status.oldest_sync:
+        embed.add_field(
+            name="Oldest synchronization",
+            value=f"<t:{int(status.oldest_sync.timestamp())}:R>",
+            inline=False,
+        )
+    await interaction.followup.send(embed=embed)
+
+
 @tree.command(name="image", description="Generate an image from a text prompt.")
 @app_commands.describe(prompt="Describe the image you want.")
 async def image(interaction: discord.Interaction, prompt: str):
@@ -214,14 +470,209 @@ async def build(interaction: discord.Interaction, description: str):
 
 automod_group = app_commands.Group(name="automod", description="Configure automatic message moderation.")
 raid_group = app_commands.Group(name="raid", description="Configure raid protection.")
+config_group = app_commands.Group(name="config", description="View or change this server's bot settings.")
+
+
+async def _is_bot_admin(interaction: discord.Interaction) -> bool:
+    """Allow server managers plus members of the configured bot-admin role."""
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return False
+
+    permissions = interaction.user.guild_permissions
+    if permissions.administrator or permissions.manage_guild:
+        return True
+
+    config = await mod_store.get_guild_config(interaction.guild.id)
+    admin_role_id = config.get("admin_role_id")
+    return bool(
+        admin_role_id
+        and any(role.id == admin_role_id for role in interaction.user.roles)
+    )
+
+
+def bot_admin_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if await _is_bot_admin(interaction):
+            return True
+        raise app_commands.CheckFailure(
+            "This command requires Manage Server or the configured bot-admin role."
+        )
+
+    return app_commands.check(predicate)
+
+
+def _configuration_embed(guild: discord.Guild, config: dict) -> discord.Embed:
+    admin_role = guild.get_role(config.get("admin_role_id") or 0)
+    market_channel = guild.get_channel(config.get("market_channel_id") or 0)
+    mod_log_channel = guild.get_channel(config.get("mod_log_channel_id") or 0)
+
+    embed = discord.Embed(
+        title="Babylon bot configuration",
+        description=(
+            "Initial setup is complete."
+            if config.get("setup_complete")
+            else "Initial setup has not been completed."
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="Bot administrators",
+        value=admin_role.mention if admin_role else "Members with Manage Server",
+        inline=False,
+    )
+    embed.add_field(
+        name="Market channel",
+        value=market_channel.mention if market_channel else "Not configured",
+    )
+    embed.add_field(
+        name="Market alerts",
+        value="Enabled" if config.get("market_alerts_enabled") else "Disabled",
+    )
+    embed.add_field(
+        name="Moderation log",
+        value=mod_log_channel.mention if mod_log_channel else "Not configured",
+        inline=False,
+    )
+    return embed
+
+
+@tree.command(name="setup", description="Configure the Babylon bot for this server.")
+@app_commands.describe(
+    admin_role="Role allowed to manage bot settings",
+    market_channel="Channel for Babylon market updates",
+    mod_log_channel="Channel for private moderation events",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setup(
+    interaction: discord.Interaction,
+    admin_role: discord.Role | None = None,
+    market_channel: discord.TextChannel | None = None,
+    mod_log_channel: discord.TextChannel | None = None,
+):
+    updates = {"setup_complete": True}
+    if admin_role is not None:
+        updates["admin_role_id"] = admin_role.id
+    if market_channel is not None:
+        updates["market_channel_id"] = market_channel.id
+    elif isinstance(interaction.channel, discord.TextChannel):
+        updates["market_channel_id"] = interaction.channel.id
+    if mod_log_channel is not None:
+        updates["mod_log_channel_id"] = mod_log_channel.id
+
+    config = await mod_store.update_guild_config(interaction.guild_id, **updates)
+    await interaction.response.send_message(
+        embed=_configuration_embed(interaction.guild, config),
+        ephemeral=True,
+    )
+
+
+@config_group.command(name="view", description="Show this server's current bot settings.")
+@app_commands.guild_only()
+@bot_admin_only()
+async def config_view(interaction: discord.Interaction):
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    await interaction.response.send_message(
+        embed=_configuration_embed(interaction.guild, config),
+        ephemeral=True,
+    )
+
+
+@config_group.command(name="admin-role", description="Choose the role that can manage bot settings.")
+@app_commands.guild_only()
+@bot_admin_only()
+async def config_admin_role(interaction: discord.Interaction, role: discord.Role):
+    config = await mod_store.update_guild_config(
+        interaction.guild_id, admin_role_id=role.id, setup_complete=True
+    )
+    await interaction.response.send_message(
+        embed=_configuration_embed(interaction.guild, config),
+        ephemeral=True,
+    )
+
+
+@config_group.command(name="market-channel", description="Choose the channel for market updates.")
+@app_commands.guild_only()
+@bot_admin_only()
+async def config_market_channel(
+    interaction: discord.Interaction, channel: discord.TextChannel
+):
+    config = await mod_store.update_guild_config(
+        interaction.guild_id, market_channel_id=channel.id, setup_complete=True
+    )
+    await interaction.response.send_message(
+        embed=_configuration_embed(interaction.guild, config),
+        ephemeral=True,
+    )
+
+
+@config_group.command(name="alerts", description="Enable or disable automated market alerts.")
+@app_commands.guild_only()
+@bot_admin_only()
+async def config_alerts(interaction: discord.Interaction, enabled: bool):
+    config = await mod_store.update_guild_config(
+        interaction.guild_id, market_alerts_enabled=enabled
+    )
+    await interaction.response.send_message(
+        embed=_configuration_embed(interaction.guild, config),
+        ephemeral=True,
+    )
+
+
+@config_group.command(name="reset", description="Reset bot settings but keep moderation warnings.")
+@app_commands.describe(confirm="Must be true to confirm the reset")
+@app_commands.guild_only()
+@bot_admin_only()
+async def config_reset(interaction: discord.Interaction, confirm: bool):
+    if not confirm:
+        await interaction.response.send_message(
+            "Nothing was reset. Run the command with confirm set to True to continue.",
+            ephemeral=True,
+        )
+        return
+
+    config = await mod_store.reset_guild_config(
+        interaction.guild_id, preserve_warnings=True
+    )
+    await interaction.response.send_message(
+        content="Server bot settings were reset. Moderation warning history was preserved.",
+        embed=_configuration_embed(interaction.guild, config),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="wiki-status", description="Check the local Capital Rift wiki index.")
+@app_commands.guild_only()
+@bot_admin_only()
+async def wiki_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    payload = json.loads(await capital_rift_wiki("status"))
+    data = payload.get("data", {})
+    error = data.get("error")
+    if error:
+        await interaction.followup.send(
+            f"Capital Rift wiki is not ready: {error}", ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        (
+            "**Capital Rift wiki**\n"
+            f"Indexed notes: **{data.get('totalNotes', 0):,}**\n"
+            "Vault access: **read-only**"
+        ),
+        ephemeral=True,
+    )
 
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "You don't have permission to use this command.", ephemeral=True
-        )
+    if isinstance(error, app_commands.CheckFailure):
+        message = str(error) or "You don't have permission to use this command."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
         return
     log.exception("Slash command error", exc_info=error)
     msg = f"Something went wrong: `{error}`"
@@ -371,6 +822,7 @@ async def raid_config(
 
 tree.add_command(automod_group)
 tree.add_command(raid_group)
+tree.add_command(config_group)
 
 
 @tree.command(name="modlog", description="Set the channel moderation events get logged to.")

@@ -239,3 +239,20 @@ with unless you extend it to.
   still frames independently and stitching them — motion won't be perfectly
   coherent between frames. If a proper free-hosted text-to-video/GIF model
   becomes available on NIM, swap the implementation in `tools/gif_gen.py`.
+
+## Integrated Babylon features
+
+The root bot is the canonical runtime. It includes:
+
+- Read-only Babylon market commands and AI market lookup
+- Per-server setup and bot-admin configuration
+- A read-only Capital Rift Obsidian vault index and production calculator
+- Optional AI-assisted moderation from the upstream bot
+- Discord OAuth account-linking API contract for the Babylon website team
+
+Configuration templates are in [`.env.example`](.env.example). See
+[`docs/OBSIDIAN_VAULT_SETUP.md`](docs/OBSIDIAN_VAULT_SETUP.md) for local wiki setup and
+[`docs/DISCORD_ACCOUNT_LINKING_API.md`](docs/DISCORD_ACCOUNT_LINKING_API.md) for the website contract.
+
+Runtime files under `data/` are intentionally ignored. Deployments must use persistent storage if
+moderation settings or chat history need to survive restarts.
