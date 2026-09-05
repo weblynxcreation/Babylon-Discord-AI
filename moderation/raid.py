@@ -2,7 +2,7 @@
 Raid protection: watches member joins for a suspicious burst (many joins in
 a short window — a classic raid pattern). Once triggered, raid mode screens
 every further join against a minimum account age and kicks/bans/alerts on
-anything too new, until a moderator clears it with /raidmode off.
+anything too new, until a moderator clears it with /raid mode enabled:False.
 """
 import time
 from collections import defaultdict, deque
@@ -37,7 +37,7 @@ async def handle_join(member: discord.Member, log_func) -> None:
             guild,
             f"🚨 **Raid detected**: {len(recent)} joins in {window}s. Raid mode is now ON "
             f"(action: `{config['raid_action']}`, min account age: {config['raid_min_account_age_hours']}h). "
-            f"Run `/raidmode off` once things settle.",
+            f"Run `/raid mode enabled:False` once things settle.",
         )
 
     if config["raid_mode_active"] and account_age_hours < config["raid_min_account_age_hours"]:

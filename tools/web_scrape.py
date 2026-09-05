@@ -9,6 +9,8 @@ robots.txt before fetching, times out quickly, and caps how much content
 it pulls back so it doesn't blow the model's context window on one page.
 """
 import asyncio
+import ipaddress
+import socket
 import urllib.robotparser
 from urllib.parse import urljoin, urlparse
 
@@ -19,6 +21,46 @@ USER_AGENT = "Mozilla/5.0 (compatible; DiscordAIAgent/1.0; +https://github.com/)
 MAX_CHARS = 6000
 MAX_LINKS = 25
 TIMEOUT_SECONDS = 15
+
+
+def _is_safe_public_ip(ip_str: str) -> bool:
+    """Rejects loopback/private/link-local/multicast/reserved addresses,
+    including the AWS/GCP/Azure metadata address (169.254.169.254 falls
+    under link-local). This tool takes URLs from the LLM, which can be
+    steered by content it previously read (prompt injection), so it must
+    not be usable to reach internal network services or cloud metadata."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+async def _resolves_to_public_address(url: str) -> bool:
+    hostname = urlparse(url).hostname
+    if not hostname:
+        return False
+
+    def _resolve():
+        try:
+            return {info[4][0] for info in socket.getaddrinfo(hostname, None)}
+        except socket.gaierror:
+            return set()
+
+    addresses = await asyncio.to_thread(_resolve)
+    if not addresses:
+        return False
+    # Every resolved address must be public — if a hostname resolves to
+    # both a public and a private address, treat it as unsafe rather than
+    # racing DNS (a classic DNS-rebinding SSRF pattern).
+    return all(_is_safe_public_ip(addr) for addr in addresses)
 
 
 async def _robots_allows(url: str) -> bool:
@@ -50,6 +92,9 @@ async def scrape_url(url: str, extract: str = "text") -> str:
     """
     if not url.startswith(("http://", "https://")):
         return f"Invalid URL: {url}"
+
+    if not await _resolves_to_public_address(url):
+        return f"Refusing to fetch {url}: it does not resolve to a public address."
 
     if not await _robots_allows(url):
         return f"robots.txt on this site disallows scraping {url}; skipping."

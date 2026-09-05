@@ -12,7 +12,9 @@ import zipfile
 import shutil
 import time
 
-OUTPUT_ROOT = "/home/claude/discord-ai-agent/generated"
+# Relative to this repo's root (not a machine-specific absolute path), so it
+# works on whatever host actually runs the bot.
+OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "generated")
 
 
 async def package_files(project_name: str, files: list[dict]) -> str:
@@ -23,11 +25,21 @@ async def package_files(project_name: str, files: list[dict]) -> str:
     safe_name = "".join(c for c in project_name if c.isalnum() or c in "-_") or "project"
     ts = int(time.time())
     project_dir = os.path.join(OUTPUT_ROOT, f"{safe_name}-{ts}")
+    project_dir_resolved = os.path.realpath(project_dir)
     os.makedirs(project_dir, exist_ok=True)
 
     for f in files:
-        rel_path = f["path"].lstrip("/")
-        full_path = os.path.join(project_dir, rel_path)
+        rel_path = (f.get("path") or "").lstrip("/")
+        if not rel_path:
+            raise ValueError("Every file needs a non-empty path.")
+
+        full_path = os.path.realpath(os.path.join(project_dir, rel_path))
+        # Reject any path (e.g. containing "..") that would escape the
+        # project directory — files are written from LLM-generated paths,
+        # which should never be trusted to stay inside the sandbox on their own.
+        if os.path.commonpath([full_path, project_dir_resolved]) != project_dir_resolved:
+            raise ValueError(f"File path escapes the project directory: {f.get('path')!r}")
+
         os.makedirs(os.path.dirname(full_path) or project_dir, exist_ok=True)
         with open(full_path, "w", encoding="utf-8") as fh:
             fh.write(f["content"])
