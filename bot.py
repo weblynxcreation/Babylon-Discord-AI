@@ -80,10 +80,21 @@ async def _send_agent_result(channel_or_interaction, result, followup: bool = Fa
 
     content = result.text[:1900] if result.text else "Done."
 
-    if followup:
-        await channel_or_interaction.followup.send(content=content, files=files or discord.utils.MISSING)
-    else:
-        await channel_or_interaction.send(content=content, files=files or None)
+    try:
+        if followup:
+            await channel_or_interaction.followup.send(content=content, files=files or discord.utils.MISSING)
+        else:
+            await channel_or_interaction.send(content=content, files=files or None)
+    finally:
+        # package_files writes a real zip to disk (tools/codegen.py); once
+        # it's been read into the Discord upload above, nothing else needs
+        # it, so clean it up. Without this, generated/*.zip accumulates on
+        # disk forever for every /build call.
+        if result.zip_path and os.path.exists(result.zip_path):
+            try:
+                os.remove(result.zip_path)
+            except OSError:
+                log.warning("Could not remove generated zip at %s", result.zip_path)
 
 
 async def _mod_log(guild: discord.Guild, text: str) -> None:

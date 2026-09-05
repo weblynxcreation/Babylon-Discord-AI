@@ -205,25 +205,28 @@ reset just one channel.
 
 ## Notes on model choice
 
-`NVIDIA_CHAT_MODEL` in `.env` must support tool/function calling — every
-feature in this bot (search, scraping, image/GIF gen, code packaging) is
-driven through tool calls, so this is the one setting that can silently
-break everything if it's wrong.
+The chat model must support tool/function calling — every feature in this
+bot (search, scraping, image/GIF gen, code packaging, the Capital Rift wiki
+and production-math tools) is driven through tool calls, so this is the one
+setting that can silently break everything if it's wrong.
 
-Confirmed-good agentic options: `nvidia/nemotron-3-ultra-550b-a55b` (best
-quality, NVIDIA's own flagship for agentic/tool-calling work) or
-`nvidia/nemotron-3.5-lightning-30b-a3b` (smaller/faster).
+**Pinned to [`openai/gpt-oss-20b`](https://build.nvidia.com/openai/gpt-oss-20b)**
+in `model_config.py`, not read from `.env`. This repo previously had the
+model swapped to a vision-only endpoint that didn't reliably emit tool
+calls, and the breakage wasn't obvious until search/tools quietly stopped
+firing — pinning it in code (with an explanation of why) makes that mistake
+harder to repeat by accident. `gpt-oss-20b` is OpenAI's smaller open-weight
+model (21B params, 3.6B active), chosen for lower latency while still
+supporting native function calling.
 
-**Currently set to `meta/llama-3.2-90b-vision-instruct`** per request — this
-is a real free NIM endpoint, but it's a *vision* model (image+text in, text
-out), and NVIDIA's own docs note vision-only models often only partially
-support function calling. Test it first: mention the bot with something
-that needs a live search (e.g. "what's today's date") and confirm it
-actually searches rather than just answering from training data. If tool
-calls don't fire reliably, switch `NVIDIA_CHAT_MODEL` back to
-`nvidia/nemotron-3-ultra-550b-a55b` — the vision model's real strength is
-looking at images you send it, which this bot doesn't currently do anything
-with unless you extend it to.
+If you ever change it, edit `model_config.py` only (both `agent.py` and
+`moderation/ai_mod.py` import `CHAT_MODEL` from there), then verify tool
+calls still fire: mention the bot with something that needs a live search
+(e.g. "what's today's date") and confirm it actually searches instead of
+answering from training data. Some backends serving gpt-oss models have had
+inconsistent tool-calling behavior depending on deployment, so don't assume
+a new model works without this check — the `.env` file's `NVIDIA_CHAT_MODEL`
+value is now unused by the bot and kept only for reference.
 
 ## Extending it
 

@@ -28,6 +28,7 @@ from tools.capital_rift import (
     WIKI_TOOL_SCHEMA,
     PRODUCTION_TOOL_SCHEMA,
 )
+from model_config import CHAT_MODEL
 
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -130,7 +131,7 @@ async def run_agent(history: list[dict], user_message: str, max_tool_rounds: int
     user_message: the new incoming message
     """
     client = _get_client()
-    model = os.environ.get("NVIDIA_CHAT_MODEL", "meta/llama-3.1-70b-instruct")
+    model = CHAT_MODEL
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
