@@ -125,7 +125,7 @@ class AgentResult:
         self.zip_path: str | None = None
 
 
-async def run_agent(history: list[dict], user_message: str, max_tool_rounds: int = 4) -> AgentResult:
+async def run_agent(history: list[dict], user_message: str, max_tool_rounds: int = 8) -> AgentResult:
     """
     history: list of {"role": "user"|"assistant", "content": str} from prior turns
     user_message: the new incoming message
@@ -209,7 +209,23 @@ async def run_agent(history: list[dict], user_message: str, max_tool_rounds: int
                 }
             )
 
-    # Ran out of tool rounds — ask for a final answer with no more tool use.
+    # Ran out of tool rounds. Rather than silently stripping tool access and
+    # hoping for text, tell the model plainly that its research budget is
+    # spent and it must answer now from what's already in the transcript —
+    # this is what was producing empty "(No response generated.)" replies
+    # when a multi-step wiki lookup (search -> read -> calculate) needed one
+    # more round than was available.
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "You're out of additional tool calls for this turn. Using only "
+                "the tool results already gathered above, give your best complete "
+                "answer now. If something genuinely necessary is still missing, "
+                "say plainly what's missing instead of leaving a blank reply."
+            ),
+        }
+    )
     final = await asyncio.to_thread(
         client.chat.completions.create,
         model=model,
@@ -217,5 +233,22 @@ async def run_agent(history: list[dict], user_message: str, max_tool_rounds: int
         temperature=0.7,
         max_tokens=1024,
     )
-    result.text = final.choices[0].message.content or "(No response generated.)"
+    text = final.choices[0].message.content or ""
+    if not text.strip():
+        # Model still returned nothing — retry once, more directively, before
+        # giving up. Cheap insurance since this path only triggers when the
+        # tool budget is already exhausted (rare with max_tool_rounds=8).
+        retry = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=model,
+            messages=messages
+            + [{"role": "user", "content": "Please respond now with your answer, in plain text."}],
+            temperature=0.3,
+            max_tokens=1024,
+        )
+        text = retry.choices[0].message.content or (
+            "I gathered some information but ran into trouble putting together a final "
+            "answer — could you try asking again, maybe a bit more specifically?"
+        )
+    result.text = text
     return result
