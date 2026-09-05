@@ -105,6 +105,65 @@ async def _mod_log(guild: discord.Guild, text: str) -> None:
         log.info(f"[mod-log:{guild.name}] {text}")
 
 
+def _format_welcome_message(template: str, member: discord.Member) -> str:
+    """Expand only supported placeholders; never permit mass mentions."""
+    return (
+        template.replace("{member}", member.mention)
+        .replace("{member_name}", member.display_name)
+        .replace("{server}", member.guild.name)
+    )[:4000]
+
+
+class WelcomeMessageView(discord.ui.LayoutView):
+    """Gold Components V2 welcome card following the shared template style."""
+
+    def __init__(self, member: discord.Member, message: str, *, preview: bool = False):
+        super().__init__(timeout=None)
+        footer = (
+            "-# Preview — this message will post when a member joins."
+            if preview
+            else f"-# Member #{member.guild.member_count} · Babylon AI"
+        )
+        container = discord.ui.Container(
+            discord.ui.Section(
+                discord.ui.TextDisplay(f"# 👋 Welcome, {member.mention}!"),
+                discord.ui.TextDisplay(f"You have joined **{member.guild.name}**."),
+                accessory=discord.ui.Thumbnail(
+                    member.display_avatar.url,
+                    description=f"{member.display_name}'s Discord avatar",
+                ),
+            ),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(message),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(footer),
+            accent_color=13938487,  # Babylon template gold: #D4AF37
+        )
+        self.add_item(container)
+
+
+async def _send_welcome(member: discord.Member) -> None:
+    config = await mod_store.get_guild_config(member.guild.id)
+    if not config.get("welcome_enabled") or not config.get("welcome_channel_id"):
+        return
+
+    channel = member.guild.get_channel(config["welcome_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        log.warning("Configured welcome channel is unavailable for %s", member.guild.name)
+        return
+
+    try:
+        await channel.send(
+            view=WelcomeMessageView(
+                member,
+                _format_welcome_message(config["welcome_message"], member),
+            ),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    except discord.Forbidden:
+        log.warning("Missing permission to post welcome messages in %s", member.guild.name)
+
+
 @client.event
 async def on_ready():
     if DISCORD_GUILD_ID:
@@ -128,6 +187,7 @@ async def on_ready():
 @client.event
 async def on_member_join(member: discord.Member):
     await raid.handle_join(member, _mod_log)
+    await _send_welcome(member)
 
 
 @client.event
@@ -473,6 +533,7 @@ async def build(interaction: discord.Interaction, description: str):
 automod_group = app_commands.Group(name="automod", description="Configure automatic message moderation.")
 raid_group = app_commands.Group(name="raid", description="Configure raid protection.")
 config_group = app_commands.Group(name="config", description="View or change this server's bot settings.")
+welcome_group = app_commands.Group(name="welcome", description="Configure new-member welcome messages.")
 
 
 async def _is_bot_admin(interaction: discord.Interaction) -> bool:
@@ -640,6 +701,63 @@ async def config_reset(interaction: discord.Interaction, confirm: bool):
         content="Server bot settings were reset. Moderation warning history was preserved.",
         embed=_configuration_embed(interaction.guild, config),
         ephemeral=True,
+    )
+
+
+@welcome_group.command(name="configure", description="Configure the channel and text for new-member welcomes.")
+@app_commands.describe(
+    channel="Channel where welcome messages will be posted",
+    message="Use {member}, {member_name}, and {server} as placeholders",
+    enabled="Turn welcome messages on or off",
+)
+@app_commands.guild_only()
+@bot_admin_only()
+async def welcome_configure(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+    message: app_commands.Range[str, 1, 1000] | None = None,
+    enabled: bool | None = None,
+):
+    updates = {}
+    if channel is not None:
+        updates["welcome_channel_id"] = channel.id
+    if message is not None:
+        updates["welcome_message"] = message
+    if enabled is not None:
+        updates["welcome_enabled"] = enabled
+
+    if not updates:
+        await interaction.response.send_message(
+            "Choose a channel, message, or enabled value to update welcome messages.",
+            ephemeral=True,
+        )
+        return
+
+    config = await mod_store.update_guild_config(interaction.guild_id, **updates)
+    configured_channel = interaction.guild.get_channel(config["welcome_channel_id"] or 0)
+    state = "enabled" if config["welcome_enabled"] else "disabled"
+    await interaction.response.send_message(
+        f"Welcome messages are **{state}**. Channel: "
+        f"{configured_channel.mention if configured_channel else 'not configured'}\n"
+        f"Message: {config['welcome_message']}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@welcome_group.command(name="preview", description="Preview this server's welcome message.")
+@app_commands.guild_only()
+@bot_admin_only()
+async def welcome_preview(interaction: discord.Interaction):
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    await interaction.response.send_message(
+        view=WelcomeMessageView(
+            interaction.user,
+            _format_welcome_message(config["welcome_message"], interaction.user),
+            preview=True,
+        ),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -971,6 +1089,7 @@ async def raid_config(
 tree.add_command(automod_group)
 tree.add_command(raid_group)
 tree.add_command(config_group)
+tree.add_command(welcome_group)
 
 
 @tree.command(name="modlog", description="Set the channel moderation events get logged to.")
