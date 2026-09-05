@@ -18,7 +18,7 @@ DEFAULT_GUILD_CONFIG = {
     "market_alerts_enabled": False,
     "welcome_enabled": False,
     "welcome_channel_id": None,
-    "welcome_message": "Welcome {member} to **{server}**! Please take a moment to read the server information.",
+    "welcome_message": "Welcome {member} to **{server}**! We are glad you are here.\n\n• Please read the server rules and information.\n• Choose any community roles that fit you.\n• Introduce yourself and jump into the conversation.\n\nIf you need help, ask a moderator or mention the bot.",
     "automod_enabled": True,
     "banned_words": [],
     "max_mentions": 5,
