@@ -759,15 +759,12 @@ async def welcome_configure(
 @bot_admin_only()
 async def welcome_preview(interaction: discord.Interaction):
     config = await mod_store.get_guild_config(interaction.guild_id)
-    embed = discord.Embed(
-        title=f"Welcome to {interaction.guild.name}!",
-        description=_format_welcome_message(config["welcome_message"], interaction.user),
-        color=discord.Color.blurple(),
-    )
-    embed.set_thumbnail(url=interaction.user.display_avatar.url)
-    embed.set_footer(text="Preview — not sent to the welcome channel")
     await interaction.response.send_message(
-        embed=embed,
+        view=WelcomeMessageView(
+            interaction.user,
+            _format_welcome_message(config["welcome_message"], interaction.user),
+            preview=True,
+        ),
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
