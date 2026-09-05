@@ -123,6 +123,34 @@ def _format_welcome_message(template: str, member: discord.Member) -> str:
     )[:4000]
 
 
+class WelcomeMessageView(discord.ui.LayoutView):
+    """Gold Components V2 welcome card following the shared template style."""
+
+    def __init__(self, member: discord.Member, message: str, *, preview: bool = False):
+        super().__init__(timeout=None)
+        footer = (
+            "-# Preview — this message will post when a member joins."
+            if preview
+            else f"-# Member #{member.guild.member_count} · Babylon AI"
+        )
+        container = discord.ui.Container(
+            discord.ui.Section(
+                discord.ui.TextDisplay(f"# 👋 Welcome, {member.mention}!"),
+                discord.ui.TextDisplay(f"You have joined **{member.guild.name}**."),
+                accessory=discord.ui.Thumbnail(
+                    member.display_avatar.url,
+                    description=f"{member.display_name}'s Discord avatar",
+                ),
+            ),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(message),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(footer),
+            accent_color=13938487,  # Babylon template gold: #D4AF37
+        )
+        self.add_item(container)
+
+
 async def _send_welcome(member: discord.Member) -> None:
     config = await mod_store.get_guild_config(member.guild.id)
     if not config.get("welcome_enabled") or not config.get("welcome_channel_id"):
@@ -133,17 +161,12 @@ async def _send_welcome(member: discord.Member) -> None:
         log.warning("Configured welcome channel is unavailable for %s", member.guild.name)
         return
 
-    embed = discord.Embed(
-        title=f"Welcome to {member.guild.name}!",
-        description=_format_welcome_message(config["welcome_message"], member),
-        color=discord.Color.blurple(),
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"Member #{member.guild.member_count}")
-
     try:
         await channel.send(
-            embed=embed,
+            view=WelcomeMessageView(
+                member,
+                _format_welcome_message(config["welcome_message"], member),
+            ),
             allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
         )
     except discord.Forbidden:
