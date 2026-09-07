@@ -9,16 +9,33 @@
 **/__pycache__/
 **/*.py[cod]
 **/*.egg-info/
+**/.eggs/
 **/.pytest_cache/
 **/.mypy_cache/
 **/.ruff_cache/
+
+# Python build and packaging artifacts
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+parts/
+sdist/
+var/
+lib/
+lib64/
+*.egg
+*.log
+*.zip
 
 # Runtime state and generated artifacts
 **/data/
 **/*.db
 **/*.sqlite
 **/*.sqlite3
-**/*.zip
+**/*.sqlite3-shm
+**/*.sqlite3-wal
 
 # Nested repo clones (full copy of the same GitHub repo, local only)
 primary-repo/
