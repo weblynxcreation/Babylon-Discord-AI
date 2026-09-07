@@ -39,6 +39,9 @@ from babylon_market import (
 
 load_dotenv()
 
+from response_cards import send_card
+from wiki_cards import format_wiki_note
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("discord-ai-agent")
 
@@ -67,7 +70,7 @@ DISCORD_FILE_SIZE_LIMIT = 8 * 1024 * 1024  # 8MB default (non-boosted) server li
 
 
 async def _send_agent_result(channel_or_interaction, result, followup: bool = False):
-    """Send text, then any image/zip attachments produced by the agent turn."""
+    """Send Components V2 cards with generated images and file attachments."""
     files = []
     if result.image_bytes:
         files.append(discord.File(io.BytesIO(result.image_bytes), filename="generated.png"))
@@ -80,12 +83,12 @@ async def _send_agent_result(channel_or_interaction, result, followup: bool = Fa
         else:
             result.text += f"\n\n⚠️ The generated project ({size // 1024}KB) is too large to attach here."
 
-    content = result.text[:1900] if result.text else "Done."
-
-    if followup:
-        await channel_or_interaction.followup.send(content=content, files=files or discord.utils.MISSING)
-    else:
-        await channel_or_interaction.send(content=content, files=files or None)
+    send = channel_or_interaction.followup.send if followup else channel_or_interaction.send
+    failed = result.status != "completed"
+    await send_card(
+        send, "Request incomplete" if failed else "Babylon Helper",
+        result.text or "Done.", error=failed, files=files,
+    )
 
 
 async def _mod_log(guild: discord.Guild, text: str) -> None:
@@ -171,19 +174,21 @@ async def on_message(message: discord.Message):
     if not content:
         return
 
-    async with message.channel.typing():
-        history = await chat_history.get_history(message.channel.id, limit=HISTORY_LIMIT)
-        try:
+    history = await chat_history.get_history(message.channel.id, limit=HISTORY_LIMIT)
+    try:
+        async with message.channel.typing():
             result = await run_agent(history, content)
-        except Exception as e:
-            log.exception("Agent run failed")
-            await message.channel.send(f"Something went wrong: `{e}`")
-            return
+    except Exception:
+        log.exception("Agent run failed")
+        await message.channel.send("I couldn't complete this request. Please try again in a moment.")
+        return
 
+    # Stop typing before Discord delivery or persistence; failed turns should
+    # not become factual conversation context for subsequent requests.
+    await _send_agent_result(message.channel, result)
+    if result.status == "completed":
         await chat_history.append_message(message.channel.id, "user", content, max_history=HISTORY_LIMIT)
         await chat_history.append_message(message.channel.id, "assistant", result.text, max_history=HISTORY_LIMIT)
-
-        await _send_agent_result(message.channel, result)
 
 
 @tree.command(name="ask", description="Ask the AI agent a one-off question (with live web search).")
@@ -671,19 +676,8 @@ async def wiki_status(interaction: discord.Interaction):
 # Capital Rift direct wiki commands (no AI tool-calling required)
 # ---------------------------------------------------------------------------
 
-def _wiki_embed(title: str, note: dict, *, color: discord.Color) -> discord.Embed:
-    """Render a vault note safely inside Discord's embed limits."""
-    source = note.get("path", "Unknown wiki note")
-    body = (note.get("content") or "").strip()
-    if len(body) > 3900:
-        body = body[:3897].rstrip() + "…"
-    embed = discord.Embed(
-        title=title[:256],
-        description=body or "This wiki note has no readable content.",
-        color=color,
-    )
-    embed.set_footer(text=f"Capital Rift wiki · Source: {source}")
-    return embed
+async def _send_wiki_card(interaction, title, note):
+    await send_card(interaction.followup.send, title, **format_wiki_note(note))
 
 
 async def _capital_rift_note(query: str, kind: str) -> tuple[dict | None, str | None]:
@@ -742,11 +736,9 @@ async def item_lookup(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(name, "item")
     if error:
-        await interaction.followup.send(error, ephemeral=True)
+        await send_card(interaction.followup.send, "Wiki lookup unavailable", error, error=True, ephemeral=True)
         return
-    await interaction.followup.send(
-        embed=_wiki_embed(f"Item · {note.get('title', name)}", note, color=discord.Color.blue())
-    )
+    await _send_wiki_card(interaction, f"Item · {note.get('title', name)}", note)
 
 
 @tree.command(name="recipe", description="Look up a Capital Rift recipe in the local wiki.")
@@ -755,11 +747,9 @@ async def recipe_lookup(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(name, "recipe")
     if error:
-        await interaction.followup.send(error, ephemeral=True)
+        await send_card(interaction.followup.send, "Wiki lookup unavailable", error, error=True, ephemeral=True)
         return
-    await interaction.followup.send(
-        embed=_wiki_embed(f"Recipe · {note.get('title', name)}", note, color=discord.Color.orange())
-    )
+    await _send_wiki_card(interaction, f"Recipe · {note.get('title', name)}", note)
 
 
 @tree.command(name="machine", description="Look up a Capital Rift production machine in the local wiki.")
@@ -768,11 +758,9 @@ async def machine_lookup(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(name, "machine")
     if error:
-        await interaction.followup.send(error, ephemeral=True)
+        await send_card(interaction.followup.send, "Wiki lookup unavailable", error, error=True, ephemeral=True)
         return
-    await interaction.followup.send(
-        embed=_wiki_embed(f"Machine · {note.get('title', name)}", note, color=discord.Color.purple())
-    )
+    await _send_wiki_card(interaction, f"Machine · {note.get('title', name)}", note)
 
 
 @tree.command(name="production", description="Calculate machines required for a Capital Rift output target.")

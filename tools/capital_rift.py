@@ -124,6 +124,7 @@ def _response(action: str, data) -> str:
             "data": data,
         },
         separators=(",", ":"),
+        allow_nan=False,
     )
 
 
@@ -204,6 +205,41 @@ async def capital_rift_wiki(
         )
 
 
+def _number(value, field: str, *, allow_zero: bool = False) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{field} must be a finite number.") from None
+    if not math.isfinite(number) or number < 0 or (number == 0 and not allow_zero):
+        bound = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{field} must be finite and {bound}.")
+    return number
+
+
+def _normalize_ingredients(ingredients) -> list[dict]:
+    if ingredients is None:
+        return []
+    if isinstance(ingredients, str):
+        try:
+            ingredients = json.loads(ingredients)
+        except ValueError:
+            raise ValueError("ingredients must be an array or a JSON-encoded array.") from None
+    if not isinstance(ingredients, list):
+        raise ValueError("ingredients must be an array of ingredient objects.")
+    normalized = []
+    for ingredient in ingredients:
+        if not isinstance(ingredient, dict):
+            raise ValueError("Every ingredient must be an object with name and amount_per_cycle.")
+        name = ingredient.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Every ingredient needs a non-empty string name.")
+        amount = _number(ingredient.get("amount_per_cycle"), "amount_per_cycle", allow_zero=True)
+        normalized.append({"name": name.strip(), "amount_per_cycle": amount})
+    return normalized
+
+
 async def calculate_production_line(
     recipe_name: str,
     source_note: str,
@@ -212,40 +248,40 @@ async def calculate_production_line(
     cycle_seconds: float,
     machine_speed_multiplier: float = 1,
     planned_utilization: float = 1,
-    ingredients: list[dict] | None = None,
+    ingredients: list[dict] | str | None = None,
 ) -> str:
     """Calculate rates from supplied facts; this function performs no AI estimation."""
-    values = {
-        "target_output_per_minute": target_output_per_minute,
-        "output_per_cycle": output_per_cycle,
-        "cycle_seconds": cycle_seconds,
-        "machine_speed_multiplier": machine_speed_multiplier,
-    }
-    if any(float(value) <= 0 for value in values.values()):
-        raise ValueError("Target, output, cycle time, and speed multiplier must be positive.")
-    if not 0 < float(planned_utilization) <= 1:
+    target_output_per_minute = _number(target_output_per_minute, "target_output_per_minute")
+    output_per_cycle = _number(output_per_cycle, "output_per_cycle")
+    cycle_seconds = _number(cycle_seconds, "cycle_seconds")
+    machine_speed_multiplier = _number(machine_speed_multiplier, "machine_speed_multiplier")
+    planned_utilization = _number(planned_utilization, "planned_utilization")
+    if planned_utilization > 1:
         raise ValueError("Planned utilization must be greater than 0 and at most 1.")
-    if not source_note.strip():
+    if not isinstance(source_note, str) or not source_note.strip():
         raise ValueError("A supporting wiki source note is required.")
-
-    ingredients = ingredients or []
+    if not isinstance(recipe_name, str) or not recipe_name.strip():
+        raise ValueError("A recipe name is required.")
+    source_note = source_note.strip()
+    recipe_name = recipe_name.strip()
+    ingredients = _normalize_ingredients(ingredients)
     cycles_per_minute = (
         60.0 / float(cycle_seconds)
         * float(machine_speed_multiplier)
         * float(planned_utilization)
     )
     output_per_machine = float(output_per_cycle) * cycles_per_minute
+    _number(output_per_machine, "Calculated output per machine")
     exact_machines = float(target_output_per_minute) / output_per_machine
+    _number(exact_machines, "Calculated machine count")
     machines_required = max(1, math.ceil(exact_machines - 1e-12))
     full_output = machines_required * output_per_machine
     target_cycles_per_minute = float(target_output_per_minute) / float(output_per_cycle)
 
     ingredient_rates = []
     for ingredient in ingredients:
-        name = str(ingredient.get("name", "")).strip()
-        amount = float(ingredient.get("amount_per_cycle", 0))
-        if not name or amount < 0:
-            raise ValueError("Every ingredient needs a name and non-negative amount.")
+        name = ingredient["name"]
+        amount = ingredient["amount_per_cycle"]
         ingredient_rates.append(
             {
                 "name": name,
@@ -278,4 +314,5 @@ async def calculate_production_line(
             },
         },
         separators=(",", ":"),
+        allow_nan=False,
     )

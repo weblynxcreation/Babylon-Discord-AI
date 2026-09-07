@@ -46,6 +46,22 @@ while exposing public, read-only market data through Discord slash commands.
   generate images/GIFs, or write code — you don't need separate commands for
   the chat flow, only mention it.
 
+## Components V2 integration
+
+AI replies (mentions, DMs, `/ask`, `/image`, `/gif`, and `/build`) and the direct
+`/item`, `/recipe`, and `/machine` wiki lookups use shared Components V2 cards.
+The root `component_templates.py` renderer reads the existing template library in
+`discord-ai-agent/Babylon Bot Templates`; `BABYLON_TEMPLATE_VAULT` can override
+that directory. `Templates/Response Card.md` supplies the common response layout.
+
+Cards use a gold accent, a heading, separators, and a footer; incomplete requests
+use red. Long content is sent across numbered cards instead of silently truncated.
+Generated media and downloads are referenced using Media Gallery and File
+components. Mention parsing is disabled. Discord.py 2.6 or newer is required.
+
+Market, moderation, admin, wiki status, and direct production responses still use
+their previous formats. Admin preview and publishing are separate roadmap work.
+
 ## Market commands
 
 - `/market`
@@ -225,27 +241,60 @@ setup needed. Each channel keeps its most recent `HISTORY_LIMIT` messages
 the `data/` folder any time to wipe everything, or use `/clearhistory` to
 reset just one channel.
 
-## Notes on model choice
+## Agent reliability and model choice
 
-`NVIDIA_CHAT_MODEL` in `.env` must support tool/function calling — every
-feature in this bot (search, scraping, image/GIF gen, code packaging) is
-driven through tool calls, so this is the one setting that can silently
-break everything if it's wrong.
+The default is `meta/llama-3.3-70b-instruct`, a text model with function calling
+listed in [NVIDIA's model catalog](https://build.nvidia.com/meta/llama-3_3-70b-instruct).
+Set `NVIDIA_CHAT_MODEL` to override it; a blank value uses the default. Chat and
+AI moderation share this default. Existing installations should replace the old
+vision-model setting in their environment and restart the bot. Model availability
+and latency depend on the NVIDIA account and endpoint; run a live tool-calling
+smoke test after deployment.
 
-Confirmed-good agentic options: `nvidia/nemotron-3-ultra-550b-a55b` (best
-quality, NVIDIA's own flagship for agentic/tool-calling work) or
-`nvidia/nemotron-3.5-lightning-30b-a3b` (smaller/faster).
+Every AI turn (mentions, DMs, and agent-backed slash commands) performs a local
+Capital Rift wiki search before requesting an answer. This includes general chat
+so unfamiliar item names and short follow-ups cannot bypass search through topic
+classification. The current message and previous user turn supply the query.
+This lookup does not consume a model tool round. Missing configuration, empty
+matches, and lookup failures reach the model explicitly; it is instructed to
+state when it cannot verify Capital Rift facts. Search execution is enforced in
+code; interpretation of excerpts and citation accuracy still depend on the model.
 
-**Currently set to `meta/llama-3.2-90b-vision-instruct`** per request — this
-is a real free NIM endpoint, but it's a *vision* model (image+text in, text
-out), and NVIDIA's own docs note vision-only models often only partially
-support function calling. Test it first: mention the bot with something
-that needs a live search (e.g. "what's today's date") and confirm it
-actually searches rather than just answering from training data. If tool
-calls don't fire reliably, switch `NVIDIA_CHAT_MODEL` back to
-`nvidia/nemotron-3-ultra-550b-a55b` — the vision model's real strength is
-looking at images you send it, which this bot doesn't currently do anything
-with unless you extend it to.
+The primary agent uses cancellable async NVIDIA requests with automatic SDK
+retries disabled. These positive, finite environment settings bound its work:
+
+| Setting | Default | Applies to |
+| --- | --- | --- |
+| `NVIDIA_REQUEST_TIMEOUT_SECONDS` | 45 | Each model request, including the final answer |
+| `AGENT_TOOL_TIMEOUT_SECONDS` | 45 | Each tool call, including mandatory wiki search |
+| `AGENT_TURN_TIMEOUT_SECONDS` | 120 | Entire turn across search, requests, and tool rounds |
+
+The first deadline reached applies. Slow image/GIF requests may need larger tool
+and turn budgets. Tools must yield to asyncio and cooperate with cancellation;
+blocking work already dispatched by existing tools to worker threads can finish
+in the background. NVIDIA chat requests themselves no longer use worker threads.
+After the configured round limit, the final request omits tools and converts collected tool results into reference data for an answer-only prompt. This also supports endpoints that ignore `tool_choice="none"`.
+
+Timeouts produce a retry message. Mention handling exits the typing context
+before sending the reply; failed turns are not saved to conversation history.
+Slash commands deliver the same fallback through their deferred follow-up.
+
+Agent logs contain JSON events for turn, model request, tool, and round timings,
+with a shared `turn_id`, model/tool names, elapsed milliseconds, and terminal
+states. Prompt text, tool arguments/results, and provider error text are omitted.
+A tool may fail while the turn completes with an explanation; inspect both
+`tool_finished` and `turn_finished` events when diagnosing a request.
+
+Production calculations accept native ingredient arrays or JSON-encoded arrays
+and normalize numeric strings. Invalid shapes, missing ingredient fields,
+booleans, non-finite numbers, and invalid rates return validation errors rather
+than silently supplying recipe values.
+
+Reliability tests use mocked NVIDIA/Discord clients plus a real temporary wiki:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Extending it
 

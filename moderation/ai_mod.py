@@ -27,6 +27,7 @@ import logging
 import asyncio
 
 from openai import OpenAI
+from reliability import chat_model as configured_chat_model
 
 from . import automod
 
@@ -92,7 +93,7 @@ async def classify_message(content: str, model: str | None = None) -> dict:
     except RuntimeError:
         return fallback
 
-    chat_model = model or os.environ.get("NVIDIA_CHAT_MODEL", "meta/llama-3.1-70b-instruct")
+    chat_model = model or configured_chat_model()
     kwargs = dict(
         model=chat_model,
         messages=[

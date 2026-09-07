@@ -15,7 +15,7 @@ class _FakeCompletions:
         self.calls = []
         self.received_wiki_result = False
 
-    def create(self, **kwargs):
+    async def create(self, **kwargs):
         self.calls.append(kwargs)
         messages = kwargs["messages"]
 
