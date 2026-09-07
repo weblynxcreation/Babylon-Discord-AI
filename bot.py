@@ -780,7 +780,7 @@ async def machine_lookup(interaction: discord.Interaction, name: str):
     item="Output item or recipe name, for example Iron Plate",
     target_per_minute="Desired output per minute",
 )
-async def production(interaction: discord.Interaction, item: str, target_per_minute: app_commands.Range[float, 0.001, 1000000]):
+async def production(interaction: discord.Interaction, item: str, target_per_minute: app_commands.Range[float, 0.001, 1000000.0]):
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(item, "recipe")
     if error:

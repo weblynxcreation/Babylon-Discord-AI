@@ -4,6 +4,12 @@ A Discord bot that chats naturally, searches the live web for current info,
 generates images, and writes + packages code/websites as downloadable zips —
 powered by your NVIDIA NIM API key.
 
+## Shared Components V2 templates
+
+The bundled `Babylon Bot Templates/` folder contains shared Discord Components V2 layouts. Set `BABYLON_TEMPLATE_VAULT` to use another template folder; blank uses the bundled copy. Requires discord.py 2.6 or newer.
+
+Use `component_templates.build_layout_view(template_name, values)` and pass the result as `view` when sending. Existing commands are not automatically converted. Callers must apply appropriate allowed-mention restrictions when sending.
+
 ## What it does
 
 - **Chat**: mention the bot or DM it — it remembers the conversation per
