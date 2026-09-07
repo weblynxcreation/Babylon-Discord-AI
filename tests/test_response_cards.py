@@ -50,3 +50,13 @@ class ResponseCardTests(unittest.IsolatedAsyncioTestCase):
         kwargs = send.call_args.kwargs
         self.assertTrue(kwargs['ephemeral'])
         self.assertEqual(kwargs['view'].to_components()[0]['accent_color'], 0xE74C3C)
+
+    async def test_custom_accent_color(self):
+        send = AsyncMock()
+        await send_card(send, 'Market status', 'Healthy', accent=0x2ECC71)
+        self.assertEqual(send.call_args.kwargs['view'].to_components()[0]['accent_color'], 0x2ECC71)
+
+    async def test_error_accent_overrides_custom_accent(self):
+        send = AsyncMock()
+        await send_card(send, 'Failed', 'Error body', error=True, accent=0x2ECC71)
+        self.assertEqual(send.call_args.kwargs['view'].to_components()[0]['accent_color'], 0xE74C3C)

@@ -7,11 +7,17 @@ from component_templates import build_layout_view
 
 GOLD = 0xD4AF37
 ERROR = 0xE74C3C
+GREEN = 0x2ECC71
+ORANGE = 0xE67E22
 BODY_LIMIT = 3000
 
 
-def build_response_views(title, body, *, footer=None, error=False, files=(), thumbnail=None):
+def build_response_views(title, body, *, footer=None, error=False, accent=None, files=(), thumbnail=None):
     body = body or 'Done.'
+    if error:
+        accent = ERROR
+    elif accent is None:
+        accent = GOLD
     # Preserve the entire response. Each page leaves room for title and footer
     # below Discord's 4,000 aggregate display-character budget.
     chunks = [body[i:i + BODY_LIMIT] for i in range(0, len(body), BODY_LIMIT)]
@@ -23,7 +29,7 @@ def build_response_views(title, body, *, footer=None, error=False, files=(), thu
             'title': str(title)[:180] + page,
             'body': chunk if chunk.strip() else '\u200b' + chunk,
             'footer': str(footer or f'Babylon Helper · <t:{int(time())}:t>')[:350],
-            'accent_color': ERROR if error else GOLD,
+            'accent_color': accent,
         })
         if index == 0:
             for file in files:
@@ -38,11 +44,11 @@ def build_response_views(title, body, *, footer=None, error=False, files=(), thu
     return views
 
 
-async def send_card(send, title, body, *, footer=None, error=False, files=(), ephemeral=None, thumbnail=None):
+async def send_card(send, title, body, *, footer=None, error=False, accent=None, files=(), ephemeral=None, thumbnail=None):
     """Send only V2 components and explicitly referenced attachments, never embeds/content."""
     files = list(files)
     try:
-        views = build_response_views(title, body, footer=footer, error=error, files=files, thumbnail=thumbnail)
+        views = build_response_views(title, body, footer=footer, error=error, accent=accent, files=files, thumbnail=thumbnail)
         for index, view in enumerate(views):
             kwargs = {'view': view, 'allowed_mentions': discord.AllowedMentions.none()}
             if index == 0 and files:

@@ -39,7 +39,7 @@ from babylon_market import (
 
 load_dotenv()
 
-from response_cards import send_card
+from response_cards import GREEN, ORANGE, send_card
 from wiki_cards import format_wiki_note
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -180,7 +180,10 @@ async def on_message(message: discord.Message):
             result = await run_agent(history, content)
     except Exception:
         log.exception("Agent run failed")
-        await message.channel.send("I couldn't complete this request. Please try again in a moment.")
+        await send_card(
+            message.channel.send, "Request incomplete",
+            "I couldn't complete this request. Please try again in a moment.", error=True,
+        )
         return
 
     # Stop typing before Discord delivery or persistence; failed turns should
@@ -199,7 +202,7 @@ async def ask(interaction: discord.Interaction, question: str):
         result = await run_agent([], question)
     except Exception as e:
         log.exception("Agent run failed")
-        await interaction.followup.send(f"Something went wrong: `{e}`")
+        await send_card(interaction.followup.send, "Request failed", f"Something went wrong: `{e}`", error=True)
         return
     await _send_agent_result(interaction, result, followup=True)
 
@@ -213,7 +216,10 @@ async def _market_companies(interaction: discord.Interaction):
         return await market_client.get_companies()
     except BabylonAPIError as exc:
         log.warning("Babylon market request failed: %s", exc)
-        await interaction.followup.send(f"Market data is unavailable: {exc}", ephemeral=True)
+        await send_card(
+            interaction.followup.send, "Market unavailable",
+            f"Market data is unavailable: {exc}", error=True, ephemeral=True,
+        )
         return None
 
 
@@ -228,7 +234,11 @@ async def market(interaction: discord.Interaction):
     if companies is None:
         return
     if not companies:
-        await interaction.followup.send("The Babylon market currently has no listed companies.")
+        await send_card(
+            interaction.followup.send, "Babylon Stock Market",
+            "The Babylon market currently has no listed companies.",
+            footer=f"Public market data · cached for up to {BABYLON_CACHE_SECONDS:g} seconds",
+        )
         return
 
     leaders = rank_companies(companies, "value")[:5]
@@ -239,17 +249,18 @@ async def market(interaction: discord.Interaction):
         f"{format_currency(company.total_value)} · {format_percent(company.trend_pct)}"
         for index, company in enumerate(leaders, start=1)
     ]
-    embed = discord.Embed(
-        title="Babylon Stock Market",
-        url=BABYLON_SITE_BASE,
-        description="\n".join(lines),
-        color=discord.Color.gold(),
+    body = (
+        "\n".join(lines)
+        + f"\n\n**Listed companies:** {len(companies):,}"
+        + f"\n**Combined value:** {format_currency(total_cap)}"
+        + f"\n**Verified:** {verified:,}/{len(companies):,}"
     )
-    embed.add_field(name="Listed companies", value=f"{len(companies):,}")
-    embed.add_field(name="Combined value", value=format_currency(total_cap))
-    embed.add_field(name="Verified", value=f"{verified:,}/{len(companies):,}")
-    embed.set_footer(text=f"Public market data · cached for up to {BABYLON_CACHE_SECONDS:g} seconds")
-    await interaction.followup.send(embed=embed)
+    await send_card(
+        interaction.followup.send,
+        f"[Babylon Stock Market]({BABYLON_SITE_BASE})",
+        body,
+        footer=f"Public market data · cached for up to {BABYLON_CACHE_SECONDS:g} seconds",
+    )
 
 
 @tree.command(name="stock", description="Look up a company on the Babylon Stock Market.")
@@ -261,31 +272,31 @@ async def stock(interaction: discord.Interaction, company: str):
         return
     match = find_company(companies, company)
     if match is None:
-        await interaction.followup.send(
-            f"I couldn't find a listed company matching `{company[:100]}`.", ephemeral=True
+        await send_card(
+            interaction.followup.send, "Company not found",
+            f"I couldn't find a listed company matching `{company[:100]}`.",
+            error=True, ephemeral=True,
         )
         return
 
-    color = discord.Color.green() if match.trend_pct >= 0 else discord.Color.red()
-    embed = discord.Embed(
-        title=match.name,
-        url=_company_url(match.id),
-        description="Verified Capital Rift company" if match.verified else "Unverified company",
-        color=color,
+    body = (
+        ("Verified Capital Rift company" if match.verified else "Unverified company")
+        + f"\n\n**Share price:** {format_currency(match.share_price)}"
+        + f"\n**Trend:** {format_percent(match.trend_pct)}"
+        + f"\n**Total value:** {format_currency(match.total_value)}"
+        + f"\n**Net worth:** {format_currency(match.net_worth)}"
+        + f"\n**Profit/min:** {format_currency(match.profit_per_min)}"
+        + f"\n**Funded capital:** {format_currency(match.funded_capital)}"
     )
-    embed.add_field(name="Share price", value=format_currency(match.share_price))
-    embed.add_field(name="Trend", value=format_percent(match.trend_pct))
-    embed.add_field(name="Total value", value=format_currency(match.total_value))
-    embed.add_field(name="Net worth", value=format_currency(match.net_worth))
-    embed.add_field(name="Profit/min", value=format_currency(match.profit_per_min))
-    embed.add_field(name="Funded capital", value=format_currency(match.funded_capital))
     if match.last_synced_at:
-        embed.add_field(
-            name="Last synchronized",
-            value=f"<t:{int(match.last_synced_at.timestamp())}:R>",
-            inline=False,
-        )
-    await interaction.followup.send(embed=embed)
+        body += f"\n**Last synchronized:** <t:{int(match.last_synced_at.timestamp())}:R>"
+    await send_card(
+        interaction.followup.send,
+        f"[{match.name}]({_company_url(match.id)})",
+        body,
+        accent=GREEN if match.trend_pct >= 0 else None,
+        footer=f"Babylon market · cached for up to {BABYLON_CACHE_SECONDS:g} seconds",
+    )
 
 
 @stock.autocomplete("company")
@@ -331,12 +342,12 @@ async def leaders(
         f"{format_currency(value_for(company))}"
         for index, company in enumerate(ranked, start=1)
     ]
-    embed = discord.Embed(
-        title=f"Market leaders · {metric.name}",
-        description="\n".join(lines) or "No companies are currently listed.",
-        color=discord.Color.gold(),
+    await send_card(
+        interaction.followup.send,
+        f"Market leaders · {metric.name}",
+        "\n".join(lines) or "No companies are currently listed.",
+        footer=f"Public market data · cached for up to {BABYLON_CACHE_SECONDS:g} seconds",
     )
-    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="movers", description="Show the Babylon market's biggest gains and losses.")
@@ -365,10 +376,11 @@ async def movers(
             for company in items
         ) or "None"
 
-    embed = discord.Embed(title="Market movers", color=discord.Color.gold())
-    embed.add_field(name="Gainers", value=mover_lines(gainers), inline=False)
-    embed.add_field(name="Losers", value=mover_lines(losers), inline=False)
-    await interaction.followup.send(embed=embed)
+    body = f"**Gainers**\n{mover_lines(gainers)}\n\n**Losers**\n{mover_lines(losers)}"
+    await send_card(
+        interaction.followup.send, "Market movers", body,
+        footer=f"Public market data · cached for up to {BABYLON_CACHE_SECONDS:g} seconds",
+    )
 
 
 @tree.command(name="market-status", description="Check verification and synchronization health.")
@@ -388,39 +400,27 @@ async def market_status(interaction: discord.Interaction):
         and status.outdated == 0
         and status.missing_sync_time == 0
     )
-    embed = discord.Embed(
-        title="Babylon market status",
-        description=(
-            "Market API online. All listed company snapshots are current."
-            if healthy
-            else "Market API online. Some company snapshots have not recently refreshed."
-        ),
-        color=discord.Color.green() if healthy else discord.Color.orange(),
+    body = (
+        "Market API online. All listed company snapshots are current."
+        if healthy
+        else "Market API online. Some company snapshots have not recently refreshed."
     )
-    embed.add_field(name="Verified", value=f"{status.verified:,}/{status.total:,}")
-    embed.add_field(
-        name=f"Fresh (≤{BABYLON_FRESH_AFTER_MINUTES}m)", value=f"{status.fresh:,}"
+    body += (
+        f"\n\n**Verified:** {status.verified:,}/{status.total:,}"
+        f"\n**Fresh (≤{BABYLON_FRESH_AFTER_MINUTES}m):** {status.fresh:,}"
+        f"\n**Delayed (≤{BABYLON_OUTDATED_AFTER_HOURS}h):** {status.delayed:,}"
+        f"\n**Outdated (>{BABYLON_OUTDATED_AFTER_HOURS}h):** {status.outdated:,}"
+        f"\n**Missing sync time:** {status.missing_sync_time:,}"
     )
-    embed.add_field(
-        name=f"Delayed (≤{BABYLON_OUTDATED_AFTER_HOURS}h)", value=f"{status.delayed:,}"
-    )
-    embed.add_field(
-        name=f"Outdated (>{BABYLON_OUTDATED_AFTER_HOURS}h)", value=f"{status.outdated:,}"
-    )
-    embed.add_field(name="Missing sync time", value=f"{status.missing_sync_time:,}")
     if status.newest_sync:
-        embed.add_field(
-            name="Newest synchronization",
-            value=f"<t:{int(status.newest_sync.timestamp())}:R>",
-            inline=False,
-        )
+        body += f"\n**Newest synchronization:** <t:{int(status.newest_sync.timestamp())}:R>"
     if status.oldest_sync:
-        embed.add_field(
-            name="Oldest synchronization",
-            value=f"<t:{int(status.oldest_sync.timestamp())}:R>",
-            inline=False,
-        )
-    await interaction.followup.send(embed=embed)
+        body += f"\n**Oldest synchronization:** <t:{int(status.oldest_sync.timestamp())}:R>"
+    await send_card(
+        interaction.followup.send, "Babylon market status", body,
+        accent=GREEN if healthy else ORANGE,
+        footer="Verification and synchronization health",
+    )
 
 
 @tree.command(name="image", description="Generate an image from a text prompt.")
@@ -431,7 +431,7 @@ async def image(interaction: discord.Interaction, prompt: str):
         result = await run_agent([], f"Generate an image: {prompt}")
     except Exception as e:
         log.exception("Image generation failed")
-        await interaction.followup.send(f"Something went wrong: `{e}`")
+        await send_card(interaction.followup.send, "Image failed", f"Something went wrong: `{e}`", error=True)
         return
     await _send_agent_result(interaction, result, followup=True)
 
@@ -444,7 +444,7 @@ async def gif(interaction: discord.Interaction, prompt: str):
         result = await run_agent([], f"Generate an animated GIF: {prompt}")
     except Exception as e:
         log.exception("GIF generation failed")
-        await interaction.followup.send(f"Something went wrong: `{e}`")
+        await send_card(interaction.followup.send, "GIF failed", f"Something went wrong: `{e}`", error=True)
         return
     await _send_agent_result(interaction, result, followup=True)
 
@@ -452,7 +452,10 @@ async def gif(interaction: discord.Interaction, prompt: str):
 @tree.command(name="clearhistory", description="Forget the AI's conversation memory for this channel/DM.")
 async def clearhistory(interaction: discord.Interaction):
     await chat_history.clear_history(interaction.channel_id)
-    await interaction.response.send_message("Conversation history for this channel has been cleared.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "History cleared",
+        "Conversation history for this channel has been cleared.", ephemeral=True,
+    )
 
 
 @tree.command(name="build", description="Generate code or a website and get it as a downloadable zip.")
@@ -466,7 +469,7 @@ async def build(interaction: discord.Interaction, description: str):
         )
     except Exception as e:
         log.exception("Build failed")
-        await interaction.followup.send(f"Something went wrong: `{e}`")
+        await send_card(interaction.followup.send, "Build failed", f"Something went wrong: `{e}`", error=True)
         return
     await _send_agent_result(interaction, result, followup=True)
 
@@ -508,39 +511,29 @@ def bot_admin_only():
     return app_commands.check(predicate)
 
 
-def _configuration_embed(guild: discord.Guild, config: dict) -> discord.Embed:
+def _configuration_body(guild: discord.Guild, config: dict) -> str:
     admin_role = guild.get_role(config.get("admin_role_id") or 0)
     market_channel = guild.get_channel(config.get("market_channel_id") or 0)
     mod_log_channel = guild.get_channel(config.get("mod_log_channel_id") or 0)
 
-    embed = discord.Embed(
-        title="Babylon bot configuration",
-        description=(
-            "Initial setup is complete."
-            if config.get("setup_complete")
-            else "Initial setup has not been completed."
-        ),
-        color=discord.Color.gold(),
+    return (
+        ("Initial setup is complete."
+         if config.get("setup_complete")
+         else "Initial setup has not been completed.")
+        + f"\n\n**Bot administrators:** "
+        + (admin_role.mention if admin_role else "Members with Manage Server")
+        + f"\n**Market channel:** "
+        + (market_channel.mention if market_channel else "Not configured")
+        + f"\n**Market alerts:** "
+        + ("Enabled" if config.get("market_alerts_enabled") else "Disabled")
+        + f"\n**Moderation log:** "
+        + (mod_log_channel.mention if mod_log_channel else "Not configured")
     )
-    embed.add_field(
-        name="Bot administrators",
-        value=admin_role.mention if admin_role else "Members with Manage Server",
-        inline=False,
-    )
-    embed.add_field(
-        name="Market channel",
-        value=market_channel.mention if market_channel else "Not configured",
-    )
-    embed.add_field(
-        name="Market alerts",
-        value="Enabled" if config.get("market_alerts_enabled") else "Disabled",
-    )
-    embed.add_field(
-        name="Moderation log",
-        value=mod_log_channel.mention if mod_log_channel else "Not configured",
-        inline=False,
-    )
-    return embed
+
+
+async def _send_configuration_card(interaction: discord.Interaction, config: dict, *, prefix: str | None = None):
+    body = (prefix + "\n\n" if prefix else "") + _configuration_body(interaction.guild, config)
+    await send_card(interaction.response.send_message, "Babylon bot configuration", body, ephemeral=True)
 
 
 @tree.command(name="setup", description="Configure the Babylon bot for this server.")
@@ -568,10 +561,7 @@ async def setup(
         updates["mod_log_channel_id"] = mod_log_channel.id
 
     config = await mod_store.update_guild_config(interaction.guild_id, **updates)
-    await interaction.response.send_message(
-        embed=_configuration_embed(interaction.guild, config),
-        ephemeral=True,
-    )
+    await _send_configuration_card(interaction, config)
 
 
 @config_group.command(name="view", description="Show this server's current bot settings.")
@@ -579,10 +569,7 @@ async def setup(
 @bot_admin_only()
 async def config_view(interaction: discord.Interaction):
     config = await mod_store.get_guild_config(interaction.guild_id)
-    await interaction.response.send_message(
-        embed=_configuration_embed(interaction.guild, config),
-        ephemeral=True,
-    )
+    await _send_configuration_card(interaction, config)
 
 
 @config_group.command(name="admin-role", description="Choose the role that can manage bot settings.")
@@ -592,10 +579,7 @@ async def config_admin_role(interaction: discord.Interaction, role: discord.Role
     config = await mod_store.update_guild_config(
         interaction.guild_id, admin_role_id=role.id, setup_complete=True
     )
-    await interaction.response.send_message(
-        embed=_configuration_embed(interaction.guild, config),
-        ephemeral=True,
-    )
+    await _send_configuration_card(interaction, config)
 
 
 @config_group.command(name="market-channel", description="Choose the channel for market updates.")
@@ -607,10 +591,7 @@ async def config_market_channel(
     config = await mod_store.update_guild_config(
         interaction.guild_id, market_channel_id=channel.id, setup_complete=True
     )
-    await interaction.response.send_message(
-        embed=_configuration_embed(interaction.guild, config),
-        ephemeral=True,
-    )
+    await _send_configuration_card(interaction, config)
 
 
 @config_group.command(name="alerts", description="Enable or disable automated market alerts.")
@@ -620,10 +601,7 @@ async def config_alerts(interaction: discord.Interaction, enabled: bool):
     config = await mod_store.update_guild_config(
         interaction.guild_id, market_alerts_enabled=enabled
     )
-    await interaction.response.send_message(
-        embed=_configuration_embed(interaction.guild, config),
-        ephemeral=True,
-    )
+    await _send_configuration_card(interaction, config)
 
 
 @config_group.command(name="reset", description="Reset bot settings but keep moderation warnings.")
@@ -632,7 +610,8 @@ async def config_alerts(interaction: discord.Interaction, enabled: bool):
 @bot_admin_only()
 async def config_reset(interaction: discord.Interaction, confirm: bool):
     if not confirm:
-        await interaction.response.send_message(
+        await send_card(
+            interaction.response.send_message, "Reset cancelled",
             "Nothing was reset. Run the command with confirm set to True to continue.",
             ephemeral=True,
         )
@@ -641,10 +620,9 @@ async def config_reset(interaction: discord.Interaction, confirm: bool):
     config = await mod_store.reset_guild_config(
         interaction.guild_id, preserve_warnings=True
     )
-    await interaction.response.send_message(
-        content="Server bot settings were reset. Moderation warning history was preserved.",
-        embed=_configuration_embed(interaction.guild, config),
-        ephemeral=True,
+    await _send_configuration_card(
+        interaction, config,
+        prefix="Server bot settings were reset. Moderation warning history was preserved.",
     )
 
 
@@ -657,18 +635,16 @@ async def wiki_status(interaction: discord.Interaction):
     data = payload.get("data", {})
     error = data.get("error")
     if error:
-        await interaction.followup.send(
-            f"Capital Rift wiki is not ready: {error}", ephemeral=True
+        await send_card(
+            interaction.followup.send, "Wiki unavailable",
+            f"Capital Rift wiki is not ready: {error}", error=True, ephemeral=True,
         )
         return
 
-    await interaction.followup.send(
-        (
-            "**Capital Rift wiki**\n"
-            f"Indexed notes: **{data.get('totalNotes', 0):,}**\n"
-            "Vault access: **read-only**"
-        ),
-        ephemeral=True,
+    await send_card(
+        interaction.followup.send, "Capital Rift wiki",
+        f"Indexed notes: **{data.get('totalNotes', 0):,}**\nVault access: **read-only**",
+        footer="Local wiki index", ephemeral=True,
     )
 
 
@@ -772,57 +748,54 @@ async def production(interaction: discord.Interaction, item: str, target_per_min
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(item, "recipe")
     if error:
-        await interaction.followup.send(error, ephemeral=True)
+        await send_card(interaction.followup.send, "Recipe unavailable", error, error=True, ephemeral=True)
         return
 
     rate = _per_minute_rate(note.get("content", ""))
     if rate is None:
-        await interaction.followup.send(
+        await send_card(
+            interaction.followup.send, "Rate unavailable",
             "I found the recipe, but its wiki note does not contain an explicit per-minute output rate, "
             f"so I will not guess the machine count. Source: {note.get('path', 'unknown')}",
-            ephemeral=True,
+            error=True, ephemeral=True,
         )
         return
 
     machines = int(math.ceil(float(target_per_minute) / rate))
     machine = _machine_name(note.get("content", "")) or "the recipe machine"
     actual_output = machines * rate
-    embed = discord.Embed(
-        title=f"Production plan · {note.get('title', item)}",
-        description=(
-            f"Target: **{float(target_per_minute):g}/min**\n"
-            f"Recipe rate: **{rate:g}/min per machine**\n"
-            f"Machines needed: **{machines:,} {machine}**\n"
-            f"Output at full capacity: **{actual_output:g}/min**"
-        ),
-        color=discord.Color.green(),
+    body = (
+        f"Target: **{float(target_per_minute):g}/min**\n"
+        f"Recipe rate: **{rate:g}/min per machine**\n"
+        f"Machines needed: **{machines:,} {machine}**\n"
+        f"Output at full capacity: **{actual_output:g}/min**"
     )
-    embed.set_footer(text=f"Capital Rift wiki · Source: {note.get('path', 'unknown')}")
-    await interaction.followup.send(embed=embed)
+    await send_card(
+        interaction.followup.send, f"Production plan · {note.get('title', item)}", body,
+        accent=GREEN, footer=f"Capital Rift wiki · Source: {note.get('path', 'unknown')}",
+    )
 
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
         message = str(error) or "You don't have permission to use this command."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+        await send_card(send, "Command unavailable", message, error=True, ephemeral=True)
         return
     log.exception("Slash command error", exc_info=error)
-    msg = f"Something went wrong: `{error}`"
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
+    send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
+    await send_card(send, "Command failed", f"Something went wrong: `{error}`", error=True, ephemeral=True)
 
 
 @automod_group.command(name="toggle", description="Turn automod on or off for this server.")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def automod_toggle(interaction: discord.Interaction, enabled: bool):
     await mod_store.update_guild_config(interaction.guild_id, automod_enabled=enabled)
-    await interaction.response.send_message(f"Automod is now {'ON' if enabled else 'OFF'}.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Automod",
+        f"Automod is now **{'ON' if enabled else 'OFF'}**.", ephemeral=True,
+    )
 
 
 @automod_group.command(name="addword", description="Add a word/phrase to the banned list.")
@@ -833,7 +806,10 @@ async def automod_addword(interaction: discord.Interaction, word: str):
     if word.lower() not in [w.lower() for w in words]:
         words.append(word)
         await mod_store.update_guild_config(interaction.guild_id, banned_words=words)
-    await interaction.response.send_message(f"Added `{word}` to the banned word list.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Banned words",
+        f"Added `{word}` to the banned word list.", ephemeral=True,
+    )
 
 
 @automod_group.command(name="removeword", description="Remove a word/phrase from the banned list.")
@@ -842,7 +818,10 @@ async def automod_removeword(interaction: discord.Interaction, word: str):
     config = await mod_store.get_guild_config(interaction.guild_id)
     words = [w for w in config["banned_words"] if w.lower() != word.lower()]
     await mod_store.update_guild_config(interaction.guild_id, banned_words=words)
-    await interaction.response.send_message(f"Removed `{word}` from the banned word list.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Banned words",
+        f"Removed `{word}` from the banned word list.", ephemeral=True,
+    )
 
 
 @automod_group.command(name="settings", description="Show current automod settings.")
@@ -859,7 +838,7 @@ async def automod_settings(interaction: discord.Interaction):
         f"**AI moderation**: {'ON' if config['ai_automod_enabled'] else 'OFF'}"
         f" (min {config['ai_automod_min_chars']} chars, log low-severity: {config['ai_automod_log_low_severity']})"
     )
-    await interaction.response.send_message(text, ephemeral=True)
+    await send_card(interaction.response.send_message, "Automod settings", text, ephemeral=True)
 
 
 @automod_group.command(
@@ -869,12 +848,13 @@ async def automod_settings(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(manage_guild=True)
 async def automod_ai_toggle(interaction: discord.Interaction, enabled: bool):
     await mod_store.update_guild_config(interaction.guild_id, ai_automod_enabled=enabled)
-    await interaction.response.send_message(
-        f"AI-powered moderation is now {'ON' if enabled else 'OFF'}.\n"
-        + ("It runs on every message that passes keyword automod and is at least the configured "
-           "minimum length — use `/automod ai-settings` to tune that." if enabled else ""),
-        ephemeral=True,
-    )
+    body = f"AI-powered moderation is now **{'ON' if enabled else 'OFF'}**."
+    if enabled:
+        body += (
+            "\n\nIt runs on every message that passes keyword automod and is at least the configured "
+            "minimum length — use `/automod ai-settings` to tune that."
+        )
+    await send_card(interaction.response.send_message, "AI moderation", body, ephemeral=True)
 
 
 @automod_group.command(
@@ -905,14 +885,17 @@ async def automod_ai_settings(
         f"Severity → action: none = ignore, low = log only, medium = delete + counts toward "
         f"the 3-strike timeout, high = delete + immediate 10-minute timeout."
     )
-    await interaction.response.send_message(text, ephemeral=True)
+    await send_card(interaction.response.send_message, "AI moderation settings", text, ephemeral=True)
 
 
 @raid_group.command(name="mode", description="Manually turn raid lockdown mode on or off.")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def raid_mode(interaction: discord.Interaction, enabled: bool):
     await mod_store.update_guild_config(interaction.guild_id, raid_mode_active=enabled)
-    await interaction.response.send_message(f"Raid mode is now {'ON' if enabled else 'OFF'}.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Raid mode",
+        f"Raid mode is now **{'ON' if enabled else 'OFF'}**.", ephemeral=True,
+    )
 
 
 @raid_group.command(name="config", description="Configure raid protection thresholds.")
@@ -953,7 +936,7 @@ async def raid_config(
         f"**Min account age**: {config['raid_min_account_age_hours']}h\n"
         f"**Action**: {config['raid_action']}"
     )
-    await interaction.response.send_message(text, ephemeral=True)
+    await send_card(interaction.response.send_message, "Raid protection settings", text, ephemeral=True)
 
 
 tree.add_command(automod_group)
@@ -965,7 +948,10 @@ tree.add_command(config_group)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def modlog(interaction: discord.Interaction, channel: discord.TextChannel):
     await mod_store.update_guild_config(interaction.guild_id, mod_log_channel_id=channel.id)
-    await interaction.response.send_message(f"Mod log set to {channel.mention}.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Mod log",
+        f"Mod log set to {channel.mention}.", ephemeral=True,
+    )
 
 
 @tree.command(name="warn", description="Warn a user (logged, DM'd, no other action taken).")
@@ -977,7 +963,10 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
         await member.send(f"You were warned in **{interaction.guild.name}**: {reason}")
     except discord.Forbidden:
         pass
-    await interaction.response.send_message(f"Warned {member.mention} (warning #{count}).", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Warning issued",
+        f"Warned {member.mention} (warning #{count}).", ephemeral=True,
+    )
 
 
 @tree.command(name="timeout", description="Time out a user for a number of minutes.")
@@ -987,10 +976,16 @@ async def timeout_cmd(interaction: discord.Interaction, member: discord.Member, 
     try:
         await member.timeout(until, reason=reason)
     except discord.Forbidden:
-        await interaction.response.send_message("I don't have permission to time out that user.", ephemeral=True)
+        await send_card(
+            interaction.response.send_message, "Timeout failed",
+            "I don't have permission to time out that user.", error=True, ephemeral=True,
+        )
         return
     await _mod_log(interaction.guild, f"⏱️ {interaction.user.mention} timed out {member.mention} for {minutes}m — {reason}")
-    await interaction.response.send_message(f"Timed out {member.mention} for {minutes} minutes.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Timeout issued",
+        f"Timed out {member.mention} for {minutes} minutes.", ephemeral=True,
+    )
 
 
 @tree.command(name="kick", description="Kick a user from the server.")
@@ -999,10 +994,16 @@ async def kick(interaction: discord.Interaction, member: discord.Member, reason:
     try:
         await member.kick(reason=reason)
     except discord.Forbidden:
-        await interaction.response.send_message("I don't have permission to kick that user.", ephemeral=True)
+        await send_card(
+            interaction.response.send_message, "Kick failed",
+            "I don't have permission to kick that user.", error=True, ephemeral=True,
+        )
         return
     await _mod_log(interaction.guild, f"👢 {interaction.user.mention} kicked {member.mention} — {reason}")
-    await interaction.response.send_message(f"Kicked {member.mention}.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Member kicked",
+        f"Kicked {member.mention}.", ephemeral=True,
+    )
 
 
 @tree.command(name="ban", description="Ban a user from the server.")
@@ -1011,19 +1012,28 @@ async def ban(interaction: discord.Interaction, member: discord.Member, reason: 
     try:
         await member.ban(reason=reason, delete_message_seconds=0)
     except discord.Forbidden:
-        await interaction.response.send_message("I don't have permission to ban that user.", ephemeral=True)
+        await send_card(
+            interaction.response.send_message, "Ban failed",
+            "I don't have permission to ban that user.", error=True, ephemeral=True,
+        )
         return
     await _mod_log(interaction.guild, f"🔨 {interaction.user.mention} banned {member.mention} — {reason}")
-    await interaction.response.send_message(f"Banned {member.mention}.", ephemeral=True)
+    await send_card(
+        interaction.response.send_message, "Member banned",
+        f"Banned {member.mention}.", ephemeral=True,
+    )
 
 
 @tree.command(name="purge", description="Delete a number of recent messages in this channel.")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def purge(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100]):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
     deleted = await interaction.channel.purge(limit=count)
     await _mod_log(interaction.guild, f"🧹 {interaction.user.mention} purged {len(deleted)} messages in {interaction.channel.mention}")
-    await interaction.followup.send(f"Deleted {len(deleted)} messages.", ephemeral=True)
+    await send_card(
+        interaction.followup.send, "Purge complete",
+        f"Deleted {len(deleted)} messages.", ephemeral=True,
+    )
 
 
 if __name__ == "__main__":
