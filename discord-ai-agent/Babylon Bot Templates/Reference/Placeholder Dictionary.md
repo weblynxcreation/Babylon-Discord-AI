@@ -31,9 +31,29 @@ Moderation logs render each event as `<t:{{timestamp_unix}}:f>` for the viewer's
 
 `stack_size`, `base_value`, `market_price`, `availability_text`, `recipe_name`, `output_amount`, `cycle_time`, `output_rate`, `recipe_inputs`, `input_cost`, `output_value`, `profit_per_cycle`, `profit_per_minute`
 
+## Agentic investment analysis
+
+`accent_color`, `question`, `recommended_item`, `item_wiki_url`, `item_image_url`, `machine_name`, `machine_cost`, `profit_per_minute`, `profit_per_dollar`, `investment_outcome`, `comparison_visual`, `recommendation_reasoning`, `build_steps`, `constraints`, `source_attribution`, `timestamp_unix`, `data_quality`
+
+`comparison_visual`, `recommendation_reasoning`, `build_steps`, and `constraints` must use Discord Markdown bullets or short paragraphs; Discord does not render Markdown tables. For `comparison_visual`, use one option per compact metric row with a labeled Unicode bar based only on verified values. Set `data_quality` to a source-data warning when current values, inputs, or compared alternatives are unavailable.
+
+## Slash command confirmation
+
+`result_title`, `command_name`, `result_details`, `next_step`, `timestamp_unix`, `data_quality`
+
+## Slash command settings
+
+`settings_title`, `settings_details`, `help_text`, `timestamp_unix`, `data_quality`
+
+## Slash command error
+
+`error_title`, `command_name`, `error_details`, `resolution`, `timestamp_unix`, `data_quality`
+
 ## Production line
 
 `target_rate`, `recipe_name`, `output_per_cycle`, `cycle_time`, `recipe_inputs`, `input_cost`, `machine_count`, `production_math`, `input_rates`, `layout_sketch`, `storage_plan`
+
+`layout_sketch` must show direct machine-to-machine item flow. Do not add conveyors, pipes, or any other transport entity unless it exists in the source data. Each line must be 44 characters or fewer; use short item labels in the sketch and place full machine names in `input_rates`.
 
 ## Moderation incident
 

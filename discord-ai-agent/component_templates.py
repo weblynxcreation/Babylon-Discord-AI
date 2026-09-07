@@ -14,7 +14,43 @@ DEFAULT_VAULT_ROOT = Path(__file__).with_name("Babylon Bot Templates")
 VAULT_ROOT = Path(
     os.environ.get("BABYLON_TEMPLATE_VAULT", DEFAULT_VAULT_ROOT)
 ).expanduser()
+SLASH_COMMAND_TEMPLATE_NAMES = (
+    "slash_ask", "slash_market", "slash_stock", "slash_leaders", "slash_movers",
+    "slash_market_status", "slash_image", "slash_gif", "slash_clearhistory",
+    "slash_build", "slash_automod_toggle", "slash_automod_addword",
+    "slash_automod_removeword", "slash_automod_settings", "slash_raid_mode",
+    "slash_raid_config", "slash_modlog", "slash_warn", "slash_timeout",
+    "slash_kick", "slash_ban", "slash_purge",
+)
 TEMPLATE_FILES = {
+    "agentic_investment_analysis": VAULT_ROOT / "Agentic" / "Investment Analysis.md",
+    "info_babylon_holdings_how_to": VAULT_ROOT / "Information" / "Babylon Holdings How To.md",
+    "info_share_trading_how_to": VAULT_ROOT / "Information" / "How Share Trades Work.md",
+    "slash_command_confirmation": VAULT_ROOT / "Slash Commands" / "Command Confirmation.md",
+    "slash_command_error": VAULT_ROOT / "Slash Commands" / "Command Error.md",
+    "slash_command_settings": VAULT_ROOT / "Slash Commands" / "Settings Summary.md",
+    "slash_ask": VAULT_ROOT / "Templates" / "Slash Commands" / "Ask.md",
+    "slash_market": VAULT_ROOT / "Templates" / "Slash Commands" / "Market.md",
+    "slash_stock": VAULT_ROOT / "Templates" / "Slash Commands" / "Stock.md",
+    "slash_leaders": VAULT_ROOT / "Templates" / "Slash Commands" / "Leaders.md",
+    "slash_movers": VAULT_ROOT / "Templates" / "Slash Commands" / "Movers.md",
+    "slash_market_status": VAULT_ROOT / "Templates" / "Slash Commands" / "Market Status.md",
+    "slash_image": VAULT_ROOT / "Templates" / "Slash Commands" / "Image.md",
+    "slash_gif": VAULT_ROOT / "Templates" / "Slash Commands" / "GIF.md",
+    "slash_clearhistory": VAULT_ROOT / "Templates" / "Slash Commands" / "Clear History.md",
+    "slash_build": VAULT_ROOT / "Templates" / "Slash Commands" / "Build.md",
+    "slash_automod_toggle": VAULT_ROOT / "Templates" / "Slash Commands" / "Automod Toggle.md",
+    "slash_automod_addword": VAULT_ROOT / "Templates" / "Slash Commands" / "Automod Add Word.md",
+    "slash_automod_removeword": VAULT_ROOT / "Templates" / "Slash Commands" / "Automod Remove Word.md",
+    "slash_automod_settings": VAULT_ROOT / "Templates" / "Slash Commands" / "Automod Settings.md",
+    "slash_raid_mode": VAULT_ROOT / "Templates" / "Slash Commands" / "Raid Mode.md",
+    "slash_raid_config": VAULT_ROOT / "Templates" / "Slash Commands" / "Raid Config.md",
+    "slash_modlog": VAULT_ROOT / "Templates" / "Slash Commands" / "Mod Log.md",
+    "slash_warn": VAULT_ROOT / "Templates" / "Slash Commands" / "Warn.md",
+    "slash_timeout": VAULT_ROOT / "Templates" / "Slash Commands" / "Timeout.md",
+    "slash_kick": VAULT_ROOT / "Templates" / "Slash Commands" / "Kick.md",
+    "slash_ban": VAULT_ROOT / "Templates" / "Slash Commands" / "Ban.md",
+    "slash_purge": VAULT_ROOT / "Templates" / "Slash Commands" / "Purge.md",
     "item": VAULT_ROOT / "Templates" / "Item Command.md",
     "moderation_automod_timeout": VAULT_ROOT / "Moderation" / "Automod Timeout.md",
     "moderation_incident": VAULT_ROOT / "Templates" / "Moderation Incident.md",
@@ -28,6 +64,7 @@ TEMPLATE_FILES = {
 
 _JSON_FENCE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 _PLACEHOLDER = re.compile(r"\{\{([a-zA-Z][a-zA-Z0-9_]*)\}\}")
+MAX_PRODUCTION_LAYOUT_LINE_LENGTH = 44
 
 
 class ComponentTemplateError(ValueError):
@@ -114,6 +151,16 @@ def render_template_payload(
     if strict and missing:
         names = ", ".join(sorted(missing))
         raise ComponentTemplateError(f"Missing template values: {names}")
+    if template_name == "production_line":
+        layout_sketch = values.get("layout_sketch")
+        if isinstance(layout_sketch, str):
+            longest_line = max(map(len, layout_sketch.splitlines()), default=0)
+            if longest_line > MAX_PRODUCTION_LAYOUT_LINE_LENGTH:
+                raise ComponentTemplateError(
+                    "Production layout sketch line exceeds "
+                    f"{MAX_PRODUCTION_LAYOUT_LINE_LENGTH} characters; "
+                    "use compact labels."
+                )
     return rendered
 
 

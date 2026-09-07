@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from component_templates import (  # noqa: E402
     ComponentTemplateError,
+    SLASH_COMMAND_TEMPLATE_NAMES,
     load_template_payload,
     render_template_payload,
     template_placeholders,
@@ -32,6 +33,109 @@ class ComponentTemplateTests(unittest.TestCase):
             "[Capital Rift Wiki]({{item_wiki_url}})",
             container["components"][-2]["content"],
         )
+
+    def test_agentic_investment_analysis_links_data_and_uses_discord_time(self):
+        values = {
+            name: name.replace("_", " ")
+            for name in template_placeholders("agentic_investment_analysis")
+        }
+        values.update(
+            accent_color=5763719,
+            item_wiki_url="https://wiki.capitalrift.com/items/standard_window/",
+            item_image_url="https://wiki.capitalrift.com/icons/standard_window.png",
+            timestamp_unix="1767657600",
+        )
+
+        payload = render_template_payload("agentic_investment_analysis", values)
+        serialized = str(payload)
+
+        self.assertEqual(payload["components"][0]["accent_color"], 5763719)
+        self.assertIn(
+            "comparison_visual",
+            str(load_template_payload("agentic_investment_analysis")),
+        )
+        self.assertEqual(
+            payload["components"][0]["components"][0]["accessory"]["media"]["url"],
+            "https://wiki.capitalrift.com/icons/standard_window.png",
+        )
+        self.assertIn("<t:1767657600:f>", serialized)
+        self.assertIn("<t:1767657600:R>", serialized)
+
+    def test_babylon_holdings_how_to_uses_a_logo_thumbnail(self):
+        payload = render_template_payload(
+            "info_babylon_holdings_how_to",
+            {
+                "trust_logo_url": "attachment://babylon-trust.png",
+                "timestamp_unix": "1767657600",
+                "data_quality": "-# ✓ Preview source verified.",
+            },
+        )
+        header = payload["components"][0]["components"][0]
+
+        self.assertEqual(header["accessory"]["type"], 11)
+        self.assertEqual(
+            header["accessory"]["media"]["url"],
+            "attachment://babylon-trust.png",
+        )
+
+    def test_share_trade_guide_uses_a_logo_thumbnail(self):
+        payload = render_template_payload(
+            "info_share_trading_how_to",
+            {
+                "trust_logo_url": "attachment://babylon-trust-primary-logo.png",
+                "timestamp_unix": "1767657600",
+                "data_quality": "-# ✓ Preview source verified.",
+            },
+        )
+
+        self.assertEqual(
+            payload["components"][0]["components"][0]["accessory"]["media"]["url"],
+            "attachment://babylon-trust-primary-logo.png",
+        )
+
+    def test_slash_command_templates_render_timestamps(self):
+        for name in (
+            "slash_command_confirmation",
+            "slash_command_settings",
+            "slash_command_error",
+        ):
+            with self.subTest(template=name):
+                values = {
+                    key: key.replace("_", " ")
+                    for key in template_placeholders(name)
+                }
+                values["timestamp_unix"] = "1767657600"
+                payload = render_template_payload(name, values)
+                self.assertIn("<t:1767657600:f>", str(payload))
+
+    def test_every_command_specific_template_renders(self):
+        for name in SLASH_COMMAND_TEMPLATE_NAMES:
+            with self.subTest(template=name):
+                values = {
+                    key: key.replace("_", " ")
+                    for key in template_placeholders(name)
+                }
+                values["timestamp_unix"] = "1767657600"
+                payload = render_template_payload(name, values)
+                self.assertEqual(payload["flags"], 32768)
+
+    def test_production_layout_does_not_require_a_transport_entity(self):
+        placeholders = template_placeholders("production_line")
+
+        self.assertIn("layout_sketch", placeholders)
+        self.assertNotIn("transport_system", placeholders)
+
+    def test_production_layout_rejects_lines_that_are_too_wide(self):
+        values = {
+            key: key.replace("_", " ")
+            for key in template_placeholders("production_line")
+        }
+        values["layout_sketch"] = "x" * 45
+
+        with self.assertRaises(ComponentTemplateError) as context:
+            render_template_payload("production_line", values)
+
+        self.assertIn("44 characters", str(context.exception))
 
     def test_render_replaces_values_recursively(self):
         values = {

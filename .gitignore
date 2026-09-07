@@ -20,6 +20,9 @@
 **/*.sqlite3
 **/*.zip
 
+# Nested repo clones (full copy of the same GitHub repo, local only)
+primary-repo/
+
 # Hosting and editor state
 .vercel/
 .idea/

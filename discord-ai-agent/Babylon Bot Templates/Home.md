@@ -10,6 +10,13 @@ This vault contains the shared Discord Components V2 messages used across Babylo
 
 ## Templates
 
+- [[Information/Babylon Holdings How To|Babylon Holdings How To]] — information-channel guide to the public Babylon Holdings workflow.
+- [[Information/How Share Trades Work|How Share Trades Work]] — information-channel guide to listings and confirmed share trades.
+- [[Templates/Slash Commands/Index|Slash Command Index]] — planning inventory for every registered slash command; individual command templates are not started.
+- [[Agentic/Investment Analysis|Investment Analysis]] — source-backed answer for a budget or factory investment question.
+- [[Slash Commands/Command Confirmation|Command Confirmation]] — completed command action, outcome, and next step.
+- [[Slash Commands/Settings Summary|Settings Summary]] — current automod, raid, and bot configuration.
+- [[Slash Commands/Command Error|Command Error]] — validation, permission, and unavailable-data response.
 - [[Templates/Item Command|Item Command]] — item identity, production details, economics, and a top-right item thumbnail.
 - [[Templates/Production Line|Production Line]] — target-rate calculations, required inputs, layout, and storage.
 - [[Templates/Moderation Incident|Moderation Incident]] — mod-log events for automod, raids, and moderator actions.
