@@ -256,7 +256,7 @@ class BotTimeoutDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "run_agent", AsyncMock(return_value=result)), patch.object(bot.chat_history, "get_history", AsyncMock(return_value=[])), patch.object(bot.chat_history, "append_message", AsyncMock()) as save, patch.object(bot, "_send_agent_result", AsyncMock(side_effect=send)) as deliver, patch.object(bot.client, "_connection", SimpleNamespace(user=SimpleNamespace(id=999))):
             message.mentions = [bot.client.user]
             await bot.on_message(message)
-        deliver.assert_awaited_once_with(channel, result)
+        deliver.assert_awaited_once_with(channel, result, card=False, factory=False, factory_name="hello")
         save.assert_not_awaited()
 
     async def test_slash_command_sends_timeout_followup(self):
@@ -270,5 +270,31 @@ class BotTimeoutDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await bot.ask.callback(interaction, "question")
         interaction.response.defer.assert_awaited_once()
         kwargs = interaction.followup.send.call_args.kwargs
-        self.assertNotIn("content", kwargs)
-        self.assertIn(result.text, str(kwargs["view"].to_components()))
+        self.assertEqual(kwargs["content"], result.text)
+        self.assertIn("view", kwargs)
+        self.assertEqual(kwargs["view"].children[0].label, "Send logs")
+
+
+class FactoryRoutingTests(unittest.TestCase):
+    def test_only_factory_planning_requests_opt_into_cards(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "test-only"}), patch("dotenv.load_dotenv"):
+            import bot
+        self.assertTrue(bot._wants_factory_card("How do I build a computer factory?"))
+        self.assertTrue(bot._wants_factory_card("set up a production line for iron bars"))
+        self.assertFalse(bot._wants_factory_card("What is a computer?"))
+        self.assertFalse(bot._wants_factory_card("Tell me a joke about factories"))
+
+
+class DirectWikiLookupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fuzzy_results_do_not_become_false_exact_matches(self):
+        import json
+        from unittest.mock import AsyncMock, patch
+        with patch.dict(__import__('os').environ, {"DISCORD_BOT_TOKEN": "test-only"}), patch("dotenv.load_dotenv"):
+            import bot
+        search = AsyncMock(return_value=json.dumps({"data": {"results": [{"title": "Capital Rift", "path": "Capital Rift.md"}]}}))
+        with patch("bot.capital_rift_wiki", search):
+            note, error = await bot._capital_rift_note("Definitely Not An Item", "item")
+        self.assertIsNone(note)
+        self.assertIn("No exact item named", error)

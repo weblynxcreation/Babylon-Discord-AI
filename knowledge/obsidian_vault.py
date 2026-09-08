@@ -250,3 +250,21 @@ class ObsidianVaultIndex:
             "indexPath": str(self.index_path),
             "readOnlyVault": True,
         }
+
+    async def snapshot_notes(self) -> list[dict]:
+        """Return complete indexed notes in one consistent read for recipe graphs."""
+        await self.sync()
+
+        def read():
+            conn = self._connect()
+            try:
+                return [
+                    {"path": path, "title": title, "content": content, "truncated": False}
+                    for path, title, content in conn.execute(
+                        "SELECT path, title, content FROM notes_fts ORDER BY path"
+                    )
+                ]
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(read)

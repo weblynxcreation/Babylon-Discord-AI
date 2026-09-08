@@ -48,8 +48,11 @@ while exposing public, read-only market data through Discord slash commands.
 
 ## Components V2 integration
 
-AI replies (mentions, DMs, `/ask`, `/image`, `/gif`, and `/build`) and the direct
-`/item`, `/recipe`, and `/machine` wiki lookups use shared Components V2 cards.
+Conversational replies (mentions, DMs, and `/ask`) use plain text, including
+timeout messages. `/image`, `/gif`, and `/build` explicitly opt in to cards for
+successful results. Structured wiki, market, admin, and moderation commands keep
+their existing Components V2 cards. Wiki item references link to source URLs
+read from the referenced notes; unresolved references remain plain text.
 The root `component_templates.py` renderer reads the existing template library in
 `discord-ai-agent/Babylon Bot Templates`; `BABYLON_TEMPLATE_VAULT` can override
 that directory. `Templates/Response Card.md` supplies the common response layout.
@@ -59,8 +62,7 @@ use red. Long content is sent across numbered cards instead of silently truncate
 Generated media and downloads are referenced using Media Gallery and File
 components. Mention parsing is disabled. Discord.py 2.6 or newer is required.
 
-Market, moderation, admin, wiki status, and direct production responses still use
-their previous formats. Admin preview and publishing are separate roadmap work.
+Admin preview and publishing are separate roadmap work.
 
 ## Market commands
 

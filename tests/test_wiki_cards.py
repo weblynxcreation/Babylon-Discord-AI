@@ -43,3 +43,25 @@ Internal source block
         self.assertEqual(card['body'], 'Plain iron guide.')
         self.assertIn('Guide.md', card['footer'])
         self.assertIsNone(format_wiki_note({'content': '---\nimage: "file:///private"\n---\nText'})['thumbnail'])
+
+
+class WikiLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_note_source_used_and_missing_target_stays_plain(self):
+        import json
+        from unittest.mock import AsyncMock, patch
+        from wiki_cards import linked_wiki_card
+        async def lookup(action, **kwargs):
+            if action == "read" and kwargs.get("note_path") == "Wiki/Items/Iron Ore.md":
+                return json.dumps({"data": {"content": '---\nsource: "https://wiki.capitalrift.com/items/actual-ore-page/"\n---\nOre'}})
+            return json.dumps({"data": {"error": "Not found"}})
+        note = {"path": "Wiki/Items/Iron Bar.md", "content": "# Iron Bar\nUses [[Iron Ore]] and [[Missing Item]]."}
+        with patch("tools.capital_rift.capital_rift_wiki", AsyncMock(side_effect=lookup)):
+            card = await linked_wiki_card(note)
+        self.assertIn("[Iron Ore](https://wiki.capitalrift.com/items/actual-ore-page/)", card["body"])
+        self.assertIn("Missing Item", card["body"])
+        self.assertNotIn("[Missing Item]", card["body"])
+
+    async def test_alias_and_anchor_link_to_declared_page(self):
+        from wiki_cards import wiki_text
+        text = wiki_text("[[Nails#Recipe|Press nails]]", {"Nails": "https://wiki.capitalrift.com/items/nails/"})
+        self.assertEqual(text, "[Press nails](https://wiki.capitalrift.com/items/nails/)")

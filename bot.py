@@ -11,18 +11,20 @@ Discord AI agent bot.
 Run: python bot.py
 """
 import os
+import asyncio
 import io
 import json
 import logging
 import math
 import re
 from datetime import timedelta
+from pathlib import Path
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-from agent import run_agent
+from agent import AgentResult, run_agent
 from moderation import store as mod_store, automod, ai_mod, raid
 from storage import chat_history
 from tools.capital_rift import capital_rift_wiki
@@ -39,8 +41,12 @@ from babylon_market import (
 
 load_dotenv()
 
-from response_cards import GREEN, ORANGE, send_card
-from wiki_cards import format_wiki_note
+from response_cards import GREEN, ORANGE, send_card, send_production_card
+from wiki_cards import linked_wiki_card
+from response_cards import send_factory_plan
+from tools.factory_calculator import FactoryError, full_factory_request, parse_factory_request, plan_factory
+from knowledge.obsidian_vault import VaultError
+from reliability import timeout_seconds
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("discord-ai-agent")
@@ -69,7 +75,38 @@ market_client = BabylonMarketClient(
 DISCORD_FILE_SIZE_LIMIT = 8 * 1024 * 1024  # 8MB default (non-boosted) server limit
 
 
-async def _send_agent_result(channel_or_interaction, result, followup: bool = False):
+class TimeoutLogView(discord.ui.View):
+    """One-click, redacted diagnostic delivery for a timed-out request."""
+    def __init__(self, source):
+        super().__init__(timeout=300)
+        self.source = source
+
+    @discord.ui.button(label="Send logs", style=discord.ButtonStyle.secondary, emoji="📄")
+    async def send_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = getattr(interaction, "guild", None)
+        target = None
+        if guild is not None:
+            config = await mod_store.get_guild_config(guild.id)
+            target = guild.get_channel(config.get("mod_log_channel_id") or 0)
+            if target is None:
+                target = next((channel for channel in guild.text_channels if channel.name.casefold() in {"errors", "logs", "bot-logs"}), None)
+        if target is None:
+            target = getattr(self.source, "channel", self.source)
+        log_path = Path("logs/local-bot.log")
+        text = log_path.read_text(encoding="utf-8", errors="replace")[-18000:] if log_path.exists() else "No local log file was found."
+        for name in ("DISCORD_BOT_TOKEN", "NVIDIA_API_KEY", "TAVILY_API_KEY"):
+            secret = os.environ.get(name, "").strip()
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        payload = io.BytesIO(text.encode("utf-8", errors="replace"))
+        try:
+            await target.send(content=f"Timeout diagnostics requested by {interaction.user.mention}.", file=discord.File(payload, filename="babylon-timeout-log.txt"))
+            await interaction.response.send_message(f"Logs sent to {target.mention}.", ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message("I could not send the logs to the configured log channel.", ephemeral=True)
+
+
+async def _send_agent_result(channel_or_interaction, result, followup: bool = False, *, card: bool = False, factory: bool = False, factory_name: str = "Factory setup"):
     """Send Components V2 cards with generated images and file attachments."""
     files = []
     if result.image_bytes:
@@ -84,11 +121,43 @@ async def _send_agent_result(channel_or_interaction, result, followup: bool = Fa
             result.text += f"\n\n⚠️ The generated project ({size // 1024}KB) is too large to attach here."
 
     send = channel_or_interaction.followup.send if followup else channel_or_interaction.send
-    failed = result.status != "completed"
-    await send_card(
-        send, "Request incomplete" if failed else "Babylon Helper",
-        result.text or "Done.", error=failed, files=files,
-    )
+    try:
+        if result.status == "timeout":
+            # Classic message: the timeout diagnostics button cannot live in a V2 layout.
+            await send(
+                content=(result.text or "The request ran out of time.")[:1900],
+                view=TimeoutLogView(channel_or_interaction),
+                allowed_mentions=discord.AllowedMentions.none(),
+                files=files,
+            )
+            return
+        if getattr(result, "factory_plan", None) is not None and result.status == "completed":
+            await send_factory_plan(send, result.factory_plan)
+            return
+        if card and factory and result.status == "completed":
+            await send_production_card(
+                send, factory_name,
+                result.text or "No verified factory details were found.",
+                wiki_context=getattr(result, "wiki_context", ""),
+            )
+            return
+        if card and result.status == "completed":
+            # Structured media results (/image, /gif, /build): card with attachments.
+            await send_card(send, "Babylon Helper", result.text or "Done.", files=files)
+            return
+        # Conversational replies stay plain text; deliver the full answer in
+        # <=1900-character chunks instead of truncating it.
+        text = result.text or "Done."
+        chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)]
+        for index, chunk in enumerate(chunks):
+            await send(
+                content=chunk if chunk.strip() else "\u200b",
+                allowed_mentions=discord.AllowedMentions.none(),
+                files=files if index == 0 else [],
+            )
+    finally:
+        for file in files:
+            file.close()
 
 
 async def _mod_log(guild: discord.Guild, text: str) -> None:
@@ -133,6 +202,94 @@ async def on_member_join(member: discord.Member):
     await raid.handle_join(member, _mod_log)
 
 
+def _wants_factory_card(text: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").casefold()).strip()
+    if not normalized:
+        return False
+    if full_factory_request(text) and re.search(r"\b(make|build|produce|factory|production|raw)\b", text, re.I):
+        return True
+    explicit = ("factory", "production line", "production setup", "production plan")
+    actions = ("build", "make", "setup", "set up", "produce", "factory")
+    if any(term in normalized for term in explicit) and any(term in normalized for term in actions):
+        return True
+    return bool(re.search(r"\bhow\s+(?:do|can)\s+i\s+(?:make|build)\b|\bhow\s+to\s+(?:make|build)\b|\brecipe\s+for\b", normalized))
+
+
+def _wants_overbroad_request(text: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").casefold()).strip()
+    return bool(re.search(r"\b(exhaustive|every|all)\b.*\b(production|chain|item|recipe|wiki)\b", normalized))
+
+
+def _wants_wiki_count(text: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").casefold()).strip()
+    return bool(re.search(r"\bhow many\b.*\b(items?|notes?)\b", normalized) and ("capital rift" in normalized or "wiki" in normalized))
+
+
+def _factory_subject(text: str) -> str:
+    subject = re.sub(r"[^a-zA-Z0-9 -]", " ", text or "")
+    subject = re.sub(r"\bfacotry\b", "factory", subject, flags=re.IGNORECASE)
+    subject = re.sub(r"\b(how|do|i|make|build|create|a|an|the|factory|production|line|setup|plan|for|to|of|in|please|you|capable|produce|producing|per|minute|hour|output|outputs|items?|units?)\b", " ", subject, flags=re.IGNORECASE)
+    subject = re.sub(r"\bexcavators\b", "excavator", subject, flags=re.IGNORECASE)
+    subject = re.sub(r"\b\d+(?:\.\d+)?\b", " ", subject)
+    return re.sub(r"\s+", " ", subject).strip() or "factory"
+
+
+def _overbroad_result():
+    result = AgentResult()
+    result.status = "timeout"
+    result.text = "That request is too broad to complete reliably in one turn. Try one item or one production chain at a time."
+    return result
+
+
+async def _deterministic_wiki_count_result():
+    result = AgentResult()
+    payload = json.loads(await capital_rift_wiki("status"))
+    data = payload.get("data", {})
+    if data.get("error"):
+        result.status = "error"
+        result.text = f"The Capital Rift wiki is unavailable: {data['error']}"
+    else:
+        result.status = "completed"
+        result.text = f"The local Capital Rift wiki currently contains {int(data.get('totalNotes', 0)):,} notes."
+    return result
+
+
+async def _deterministic_factory_result(request: str):
+    """Wiki-only factory lookup: no model output between the note and the card."""
+    result = AgentResult()
+    if full_factory_request(request):
+        try:
+            parsed = parse_factory_request(request)
+            result.factory_plan = await asyncio.wait_for(
+                plan_factory(parsed),
+                timeout=timeout_seconds("AGENT_TURN_TIMEOUT_SECONDS", 120),
+            )
+        except asyncio.TimeoutError:
+            result.status = "timeout"
+            result.text = "The wiki factory calculation timed out. Try a smaller production chain."
+        except (FactoryError, VaultError, OSError) as exc:
+            result.status = "error"
+            result.text = f"I couldn't calculate the full factory: {exc}"
+        return result
+    subject = _factory_subject(request)
+    note, error = await _capital_rift_note(subject, "recipe")
+    if error:
+        result.status = "error"
+        result.text = error
+        return result
+    result.status = "completed"
+    result.text = ""
+    target = None
+    match = re.search(r"(?:capable of|at|produce|producing)\s+([0-9]+(?:\.[0-9]+)?)\s+[^?!.]*?\bper\s+minute", request, re.IGNORECASE)
+    if match:
+        target = float(match.group(1))
+    context = {"exact_note": note}
+    if target is not None:
+        context["target_rate"] = target
+    result.wiki_context = json.dumps(context)
+    return result
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -174,10 +331,18 @@ async def on_message(message: discord.Message):
     if not content:
         return
 
+    is_factory = _wants_factory_card(content)
     history = await chat_history.get_history(message.channel.id, limit=HISTORY_LIMIT)
     try:
         async with message.channel.typing():
-            result = await run_agent(history, content)
+            if _wants_overbroad_request(content):
+                result = _overbroad_result()
+            elif _wants_wiki_count(content):
+                result = await _deterministic_wiki_count_result()
+            elif is_factory:
+                result = await _deterministic_factory_result(content)
+            else:
+                result = await run_agent(history, content)
     except Exception:
         log.exception("Agent run failed")
         await send_card(
@@ -188,8 +353,11 @@ async def on_message(message: discord.Message):
 
     # Stop typing before Discord delivery or persistence; failed turns should
     # not become factual conversation context for subsequent requests.
-    await _send_agent_result(message.channel, result)
-    if result.status == "completed":
+    await _send_agent_result(
+        message.channel, result, card=is_factory, factory=is_factory,
+        factory_name=_factory_subject(content),
+    )
+    if result.status == "completed" and result.text:
         await chat_history.append_message(message.channel.id, "user", content, max_history=HISTORY_LIMIT)
         await chat_history.append_message(message.channel.id, "assistant", result.text, max_history=HISTORY_LIMIT)
 
@@ -198,13 +366,24 @@ async def on_message(message: discord.Message):
 @app_commands.describe(question="What do you want to ask?")
 async def ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
+    is_factory = _wants_factory_card(question)
     try:
-        result = await run_agent([], question)
+        if _wants_overbroad_request(question):
+            result = _overbroad_result()
+        elif _wants_wiki_count(question):
+            result = await _deterministic_wiki_count_result()
+        elif is_factory:
+            result = await _deterministic_factory_result(question)
+        else:
+            result = await run_agent([], question)
     except Exception as e:
         log.exception("Agent run failed")
         await send_card(interaction.followup.send, "Request failed", f"Something went wrong: `{e}`", error=True)
         return
-    await _send_agent_result(interaction, result, followup=True)
+    await _send_agent_result(
+        interaction, result, followup=True, card=is_factory, factory=is_factory,
+        factory_name=_factory_subject(question),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +612,7 @@ async def image(interaction: discord.Interaction, prompt: str):
         log.exception("Image generation failed")
         await send_card(interaction.followup.send, "Image failed", f"Something went wrong: `{e}`", error=True)
         return
-    await _send_agent_result(interaction, result, followup=True)
+    await _send_agent_result(interaction, result, followup=True, card=True)
 
 
 @tree.command(name="gif", description="Generate a short animated GIF from a text prompt.")
@@ -446,7 +625,7 @@ async def gif(interaction: discord.Interaction, prompt: str):
         log.exception("GIF generation failed")
         await send_card(interaction.followup.send, "GIF failed", f"Something went wrong: `{e}`", error=True)
         return
-    await _send_agent_result(interaction, result, followup=True)
+    await _send_agent_result(interaction, result, followup=True, card=True)
 
 
 @tree.command(name="clearhistory", description="Forget the AI's conversation memory for this channel/DM.")
@@ -471,7 +650,7 @@ async def build(interaction: discord.Interaction, description: str):
         log.exception("Build failed")
         await send_card(interaction.followup.send, "Build failed", f"Something went wrong: `{e}`", error=True)
         return
-    await _send_agent_result(interaction, result, followup=True)
+    await _send_agent_result(interaction, result, followup=True, card=True)
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +832,8 @@ async def wiki_status(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 
 async def _send_wiki_card(interaction, title, note):
-    await send_card(interaction.followup.send, title, **format_wiki_note(note))
+    card = await linked_wiki_card(note)
+    await send_card(interaction.followup.send, title, **card)
 
 
 async def _capital_rift_note(query: str, kind: str) -> tuple[dict | None, str | None]:
@@ -666,15 +846,19 @@ async def _capital_rift_note(query: str, kind: str) -> tuple[dict | None, str | 
     if not results:
         return None, f"No {kind} matching '{query[:100]}' was found in the Capital Rift wiki."
 
-    normalized_query = query.casefold().strip()
+    def normalize(value: str) -> str:
+        return re.sub(r"[_-]+", " ", re.sub(r"\s+", " ", value.casefold().strip()))
+    normalized_query = normalize(query)
     result = next(
         (
             item for item in results
-            if item.get("title", "").casefold().strip() == normalized_query
-            or item.get("path", "").rsplit("/", 1)[-1].removesuffix(".md").casefold() == normalized_query
+            if normalize(item.get("title", "")) == normalized_query
+            or normalize(item.get("path", "").rsplit("/", 1)[-1].removesuffix(".md")) == normalized_query
         ),
-        results[0],
+        None,
     )
+    if result is None:
+        return None, f"No exact {kind} named **{query[:100]}** was found in the Capital Rift wiki."
     payload = json.loads(await capital_rift_wiki("read", note_path=result["path"]))
     data = payload.get("data", {})
     if data.get("error"):
@@ -737,6 +921,17 @@ async def machine_lookup(interaction: discord.Interaction, name: str):
         await send_card(interaction.followup.send, "Wiki lookup unavailable", error, error=True, ephemeral=True)
         return
     await _send_wiki_card(interaction, f"Machine · {note.get('title', name)}", note)
+
+
+@tree.command(name="factory", description="Create a wiki-grounded factory or production setup card.")
+@app_commands.describe(request="What should the factory produce?")
+async def factory(interaction: discord.Interaction, request: str):
+    await interaction.response.defer(thinking=True)
+    result = await _deterministic_factory_result(request)
+    await _send_agent_result(
+        interaction, result, followup=True, card=True, factory=True,
+        factory_name=_factory_subject(request),
+    )
 
 
 @tree.command(name="production", description="Calculate machines required for a Capital Rift output target.")

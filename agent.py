@@ -8,6 +8,7 @@ import os
 import json
 import asyncio
 import logging
+import re
 from time import monotonic
 from uuid import uuid4
 from openai import AsyncOpenAI, APITimeoutError
@@ -41,8 +42,11 @@ WIKI_GROUNDING_RULES = """
 Capital Rift evidence rules (override general advice to assume or fill gaps):
 - Only state game facts explicitly supported by the retrieved Capital Rift wiki.
   Training knowledge, other games, user assumptions, and earlier assistant replies
-  are not evidence. Never invent a building, parcel type, prerequisite, machine,
-  placement restriction, inventory behavior, UI action, or construction step.
+  are not evidence. There is no "factory parcel" in Capital Rift. Do not claim one
+  exists or that it is required. Machines are placed according to their machine
+  type; some types may require indoor placement, so cite the machine note or say
+  the requirement is unspecified. Never invent a building, parcel type, prerequisite,
+  machine, placement restriction, inventory behavior, UI action, or construction step.
 - Before explaining a recipe or production setup, read the full relevant recipe
   note with capital_rift_wiki(action="read", note_path=the path from search).
   Search excerpts are discovery aids and may omit ingredients, quantities, and
@@ -166,6 +170,8 @@ class AgentResult:
         self.image_bytes: bytes | None = None
         self.gif_bytes: bytes | None = None
         self.zip_path: str | None = None
+        self.wiki_context: str = ""
+        self.factory_plan = None
 
 
 def _event(event: str, turn_id: str, started: float, **fields) -> None:
@@ -253,10 +259,31 @@ async def _run_turn(history, user_message, max_tool_rounds, result, turn_id):
     previous = next((m.get("content", "") for m in reversed(history) if m.get("role") == "user"), "")
     if previous:
         query = f"{user_message} {previous}"
+    # Factory prompts often contain generic words that pollute FTS results
+    # ("factory parcel", "build a ..."). Search the product noun first.
+    if re.search(r"\b(factory|production)\b", query, re.IGNORECASE):
+        focused = re.sub(r"\b(factory|production|line|setup|plan|build|make|create|how|do|i|a|the|for|to|of|in)\b", " ", query, flags=re.IGNORECASE)
+        focused = re.sub(r"[^\w\s-]", " ", focused)
+        focused = re.sub(r"\s+", " ", focused).strip()
+        if focused:
+            query = focused
     wiki_args = {"action": "search", "query": query, "limit": 5}
     wiki_output, _ = await _invoke_tool(
         "capital_rift_wiki", wiki_args, turn_id=turn_id, round_number=0, timeout=tool_timeout,
     )
+    result.wiki_context = str(wiki_output)
+    # Resolve an exact product hit before the model writes a factory plan.
+    if re.search(r"\b(factory|production)\b", user_message, re.IGNORECASE):
+        try:
+            search_data = json.loads(str(wiki_output)).get("data", {})
+            exact = next((item for item in search_data.get("results", []) if item.get("title", "").casefold() == query.casefold()), None)
+            if exact:
+                read_args = {"action": "read", "note_path": exact["path"]}
+                read_output, _ = await _invoke_tool("capital_rift_wiki", read_args, turn_id=turn_id, round_number=0, timeout=tool_timeout)
+                wiki_output = json.dumps({"search": search_data, "exact_note": json.loads(str(read_output)).get("data", {})})
+                result.wiki_context = wiki_output
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
     messages.extend([
         {"role": "assistant", "content": "", "tool_calls": [{
             "id": "wiki_preflight", "type": "function",
