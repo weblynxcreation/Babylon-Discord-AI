@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-DEFAULT_VAULT_ROOT = Path(__file__).parent / "discord-ai-agent" / "Babylon Bot Templates"
+DEFAULT_VAULT_ROOT = Path(__file__).parent / "Babylon Bot Templates"
 VAULT_ROOT = Path(
     os.environ.get("BABYLON_TEMPLATE_VAULT", DEFAULT_VAULT_ROOT)
 ).expanduser()

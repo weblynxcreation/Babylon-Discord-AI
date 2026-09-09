@@ -9,9 +9,10 @@ while exposing public, read-only market data through Discord slash commands.
 - Root (`bot.py`, `agent.py`, `tools/`, `moderation/`, `knowledge/`) — the
   canonical runtime: Python `discord.py` bot, Babylon API client, market
   commands, moderation, AI tools, and tests.
+- `Babylon Bot Templates/` — the shared Discord Components V2 message
+  templates vault, rendered at runtime by the root `component_templates.py`.
 - `Babylonbot/` — upstream reference copy of the original bot.
-- `discord-ai-agent/` — legacy bot copy plus `Babylon Bot Templates/`, the
-  shared Discord Components V2 message templates vault.
+- `discord-ai-agent/` — legacy bot copy retained for reference.
 - `docs/` — Obsidian vault setup and Discord account-linking API contract.
 - `assets/` — shared banner and logo images.
 
@@ -53,8 +54,8 @@ timeout messages. `/image`, `/gif`, and `/build` explicitly opt in to cards for
 successful results. Structured wiki, market, admin, and moderation commands keep
 their existing Components V2 cards. Wiki item references link to source URLs
 read from the referenced notes; unresolved references remain plain text.
-The root `component_templates.py` renderer reads the existing template library in
-`discord-ai-agent/Babylon Bot Templates`; `BABYLON_TEMPLATE_VAULT` can override
+The root `component_templates.py` renderer reads the bundled template library in
+`Babylon Bot Templates/`; `BABYLON_TEMPLATE_VAULT` can override
 that directory. `Templates/Response Card.md` supplies the common response layout.
 
 Cards use a gold accent, a heading, separators, and a footer; incomplete requests

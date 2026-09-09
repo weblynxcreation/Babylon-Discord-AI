@@ -44,6 +44,7 @@ primary-repo/
 .vercel/
 .idea/
 .vscode/
+**/.obsidian/
 .obsidian/workspace.json
 .obsidian/workspace-mobile.json
 **/.obsidian/workspace.json

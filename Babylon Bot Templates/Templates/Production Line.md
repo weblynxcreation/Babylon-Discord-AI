@@ -9,7 +9,7 @@ tags:
 
 # Production Line
 
-Displays a compact, wiki-backed production plan with the output item in the top-right corner. Keep each section focused: Recipe contains recipe facts, Production Requirements contains one machine-rate sentence, Continuous Input Supply contains ingredient rates, and Suggested Layout contains only a short machine-to-output sketch. Do not invent transport entities, parcels, construction steps, or missing values. Some machine types require indoor spaces; show that only when supported by the machine note. Each layout line is limited to 44 characters.
+Displays a calculated production plan with the output item's PNG in the top-right corner. Keep the layout as a code block and show direct machine-to-machine item flow. Do not invent transport entities. Each layout line is limited to 44 characters so it remains compact in Discord; use short item labels in the sketch and keep full machine details in the input-supply section.
 
 ```json
 {
