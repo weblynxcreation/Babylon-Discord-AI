@@ -34,6 +34,11 @@ DEFAULT_GUILD_CONFIG = {
     "warnings": {},  # {user_id_str: count}
     # [{channel_id_str, message_id_str, emoji, role_id_str}]
     "reaction_roles": [],
+    "policy_enabled": False,
+    "policy_privacy_url": "https://holdings.thebabylon.hu/privacy",
+    "policy_terms_url": "https://holdings.thebabylon.hu/terms",
+    # {user_id_str: {"accepted_at": iso8601, "via": "dm-button"}}
+    "policy_acceptances": {},
 }
 
 _lock = asyncio.Lock()

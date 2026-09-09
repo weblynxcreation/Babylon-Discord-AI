@@ -17,7 +17,7 @@ import json
 import logging
 import math
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import discord
@@ -42,6 +42,7 @@ from babylon_market import (
 load_dotenv()
 
 from response_cards import GREEN, ORANGE, send_card, send_production_card
+from card_primitives import add_actions, build_card
 from wiki_cards import linked_wiki_card
 from response_cards import send_factory_plan
 from tools.factory_calculator import FactoryRequest, FactoryError, full_factory_request, parse_factory_request, parse_recipe, plan_factory
@@ -221,6 +222,190 @@ async def on_ready():
 @client.event
 async def on_member_join(member: discord.Member):
     await raid.handle_join(member, _mod_log)
+    await _maybe_send_policy_card(member)
+
+
+# ---------------------------------------------------------------------------
+# Onboarding policy acceptance (#9)
+# ---------------------------------------------------------------------------
+
+POLICY_ACCEPT_CUSTOM_ID = "policy:accept:{guild_id}"
+
+
+def _build_policy_card(config: dict, guild_id: int):
+    """Acceptance card with links to the live policy pages and one button."""
+    body = (
+        "Welcome to Babylon Holdings! Before you get full access, please review our community policies:\n\n"
+        f"- [Privacy Policy]({config.get('policy_privacy_url')})\n"
+        f"- [Terms of Service]({config.get('policy_terms_url')})\n\n"
+        "Press **I accept** below once you have read both. Your acceptance is "
+        "recorded with a timestamp and can be reviewed by server staff."
+    )
+    view = build_card(
+        "Community policies", body, state="info",
+        footer="Acceptance is required for full member access",
+    )
+    accept = discord.ui.Button(
+        label="I accept", style=discord.ButtonStyle.success,
+        custom_id=POLICY_ACCEPT_CUSTOM_ID.format(guild_id=guild_id),
+    )
+    return add_actions(view, accept)
+
+
+async def _maybe_send_policy_card(member: discord.Member) -> None:
+    """DM the acceptance card on join when enabled and not yet accepted."""
+    try:
+        config = await mod_store.get_guild_config(member.guild.id)
+    except Exception:
+        log.exception("Policy config lookup failed for guild %s", member.guild.id)
+        return
+    if not config.get("policy_enabled") or str(member.id) in config.get("policy_acceptances", {}):
+        return
+    try:
+        await member.send(view=_build_policy_card(config, member.guild.id))
+    except discord.HTTPException:
+        # Closed DMs are expected; staff can re-send via /policy resend.
+        log.info("[policy:%s] Could not DM acceptance card to %s", member.guild.id, member.id)
+
+
+async def record_policy_acceptance(guild_id: int, user_id: int, *, via: str) -> str:
+    """Store the first acceptance (idempotent) and return its ISO timestamp."""
+    config = await mod_store.get_guild_config(guild_id)
+    acceptances = dict(config.get("policy_acceptances", {}))
+    key = str(user_id)
+    if key not in acceptances:
+        acceptances[key] = {"accepted_at": datetime.now(timezone.utc).isoformat(), "via": via}
+        await mod_store.update_guild_config(guild_id, policy_acceptances=acceptances)
+    return acceptances[key]["accepted_at"]
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction):
+    """Component dispatch that survives restarts (no persistent-view registry)."""
+    custom_id = getattr(interaction.data, "get", lambda *_: None)("custom_id") if interaction.data else None
+    if interaction.type != discord.InteractionType.component or not custom_id:
+        return
+    if not custom_id.startswith("policy:accept:"):
+        return
+    try:
+        guild_id = int(custom_id.rsplit(":", 1)[1])
+    except ValueError:
+        return
+    accepted_at = await record_policy_acceptance(guild_id, interaction.user.id, via="dm-button")
+    await interaction.response.send_message(
+        f"Accepted ✓ — recorded <t:{int(datetime.fromisoformat(accepted_at).timestamp())}:f>. "
+        "Welcome aboard! Staff can verify this anytime.",
+        ephemeral=True,
+    )
+
+
+policy_group = app_commands.Group(
+    name="policy",
+    description="Configure new-member policy acceptance.",
+)
+
+
+@policy_group.command(name="enable", description="Require policy acceptance for new members.")
+@app_commands.describe(privacy_url="Privacy policy page", terms_url="Terms of service page")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def policy_enable(
+    interaction: discord.Interaction,
+    privacy_url: str | None = None,
+    terms_url: str | None = None,
+):
+    updates = {"policy_enabled": True}
+    if privacy_url:
+        updates["policy_privacy_url"] = privacy_url
+    if terms_url:
+        updates["policy_terms_url"] = terms_url
+    config = await mod_store.update_guild_config(interaction.guild_id, **updates)
+    await send_card(
+        interaction.response.send_message, "Policy acceptance enabled",
+        f"New members will be DM'd the acceptance card on join.\n\n"
+        f"- [Privacy Policy]({config['policy_privacy_url']})\n"
+        f"- [Terms of Service]({config['policy_terms_url']})\n\n"
+        f"Re-send it to existing members with `/policy resend`.",
+        accent=GREEN, ephemeral=True,
+    )
+
+
+@policy_group.command(name="disable", description="Stop requiring policy acceptance.")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def policy_disable(interaction: discord.Interaction):
+    await mod_store.update_guild_config(interaction.guild_id, policy_enabled=False)
+    await send_card(
+        interaction.response.send_message, "Policy acceptance disabled",
+        "New members will no longer receive the acceptance card. Existing acceptances are kept.",
+        ephemeral=True,
+    )
+
+
+@policy_group.command(name="status", description="Show policy acceptance settings and counts.")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def policy_status(interaction: discord.Interaction):
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    accepted = len(config.get("policy_acceptances", {}))
+    await send_card(
+        interaction.response.send_message, "Policy acceptance",
+        f"**Status:** {'Enabled' if config['policy_enabled'] else 'Disabled'}\n"
+        f"**Accepted:** {accepted:,} member(s)\n\n"
+        f"- [Privacy Policy]({config['policy_privacy_url']})\n"
+        f"- [Terms of Service]({config['policy_terms_url']})",
+        accent=GREEN if config["policy_enabled"] else None,
+        ephemeral=True,
+    )
+
+
+@policy_group.command(name="check", description="Review one member's policy acceptance.")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def policy_check(interaction: discord.Interaction, member: discord.Member):
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    record = config.get("policy_acceptances", {}).get(str(member.id))
+    if record:
+        await send_card(
+            interaction.response.send_message, "Policy accepted",
+            f"{member.mention} accepted the policies on "
+            f"<t:{int(datetime.fromisoformat(record['accepted_at']).timestamp())}:f> "
+            f"(via {record.get('via', 'unknown')}).",
+            accent=GREEN, ephemeral=True,
+        )
+    else:
+        await send_card(
+            interaction.response.send_message, "Not yet accepted",
+            f"{member.mention} has not accepted the policies. Re-send the card with `/policy resend`.",
+            error=True, ephemeral=True,
+        )
+
+
+@policy_group.command(name="resend", description="Re-send the acceptance card to one member.")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def policy_resend(interaction: discord.Interaction, member: discord.Member):
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    try:
+        await member.send(view=_build_policy_card(config, interaction.guild_id))
+    except discord.HTTPException:
+        await send_card(
+            interaction.response.send_message, "Delivery failed",
+            f"I couldn't DM {member.mention} — their DMs may be closed. "
+            "Ask them to open DMs, then try again.",
+            error=True, ephemeral=True,
+        )
+        return
+    await send_card(
+        interaction.response.send_message, "Card re-sent",
+        f"Acceptance card sent to {member.mention}.",
+        ephemeral=True,
+    )
 
 
 def _wants_factory_card(text: str) -> bool:
@@ -1511,6 +1696,7 @@ tree.add_command(automod_group)
 tree.add_command(raid_group)
 tree.add_command(config_group)
 tree.add_command(reactionroles_group)
+tree.add_command(policy_group)
 
 
 @tree.command(name="modlog", description="Set the channel moderation events get logged to.")
