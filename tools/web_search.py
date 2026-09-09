@@ -3,7 +3,8 @@ Live web search tool. Uses Tavily, which is purpose-built for feeding
 search results to LLM agents (clean text, no HTML scraping headaches).
 """
 import os
-from tavily import TavilyClient
+from tavily import AsyncTavilyClient
+from reliability import timeout_seconds
 
 _client = None
 
@@ -14,29 +15,17 @@ def _get_client():
         api_key = os.environ.get("TAVILY_API_KEY")
         if not api_key:
             raise RuntimeError("TAVILY_API_KEY is not set in the environment.")
-        _client = TavilyClient(api_key=api_key)
+        _client = AsyncTavilyClient(api_key=api_key)
     return _client
 
 
 async def web_search(query: str, max_results: int = 5) -> str:
-    """
-    Runs a live web search and returns a compact text block the LLM can
-    reason over. Tavily's client is synchronous, so this is fine to call
-    directly from an async context for our request volume; if you scale up,
-    wrap it with asyncio.to_thread.
-    """
-    import asyncio
-
+    """Use cancellable async HTTP so a timeout does not leave a search thread running."""
     client = _get_client()
-
-    def _search():
-        return client.search(
-            query=query,
-            max_results=max_results,
-            include_answer=True,
-        )
-
-    result = await asyncio.to_thread(_search)
+    result = await client.search(
+        query=query, max_results=max_results, include_answer=True,
+        timeout=timeout_seconds("AGENT_TOOL_TIMEOUT_SECONDS", 45),
+    )
 
     lines = []
     if result.get("answer"):

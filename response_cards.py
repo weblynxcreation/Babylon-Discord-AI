@@ -5,32 +5,32 @@ import discord
 
 from component_templates import build_layout_view, template_placeholders
 
-GOLD = 0xD4AF37
-ERROR = 0xE74C3C
-GREEN = 0x2ECC71
-ORANGE = 0xE67E22
-BODY_LIMIT = 3000
+from card_primitives import GOLD, ERROR, GREEN, ORANGE, BODY_LIMIT, build_card, paginate_text, validate_view
+from observability import mark_delivery, mark_status
 
 
-def build_response_views(title, body, *, footer=None, error=False, accent=None, files=(), thumbnail=None):
-    body = body or 'Done.'
+def build_response_views(title, body, *, footer=None, error=False, accent=None, files=(), thumbnail=None, state="info"):
+    if not body:
+        body = 'No results found.'
+        if not error:
+            state = 'empty'
+    if error:
+        state = 'error'
+    elif state == 'info' and accent in (GREEN, ORANGE):
+        state = 'success' if accent == GREEN else 'warning'
     if error:
         accent = ERROR
-    elif accent is None:
-        accent = GOLD
     # Preserve the entire response. Each page leaves room for title and footer
     # below Discord's 4,000 aggregate display-character budget.
-    chunks = [body[i:i + BODY_LIMIT] for i in range(0, len(body), BODY_LIMIT)]
+    chunks = paginate_text(body)
     views = []
     for index, chunk in enumerate(chunks):
         page = f' · {index + 1}/{len(chunks)}' if len(chunks) > 1 else ''
-        view = build_layout_view('wiki_response_card' if thumbnail else 'response_card', {
-            'thumbnail': thumbnail,
-            'title': str(title)[:180] + page,
-            'body': chunk if chunk.strip() else '\u200b' + chunk,
-            'footer': str(footer or f'Babylon Helper · <t:{int(time())}:t>')[:350],
-            'accent_color': accent,
-        })
+        view = build_card(
+            str(title)[:180] + page, chunk,
+            footer=str(footer or f'Babylon Helper · <t:{int(time())}:t>')[:350],
+            state=state, accent=accent, thumbnail=thumbnail,
+        )
         if index == 0:
             for file in files:
                 uri = f'attachment://{file.filename}'
@@ -40,15 +40,17 @@ def build_response_views(title, body, *, footer=None, error=False, accent=None, 
                     )))
                 else:
                     view.add_item(discord.ui.File(uri))
-        views.append(view)
+        views.append(validate_view(view))
     return views
 
 
-async def send_card(send, title, body, *, footer=None, error=False, accent=None, files=(), ephemeral=None, thumbnail=None):
+async def send_card(send, title, body, *, footer=None, error=False, accent=None, files=(), ephemeral=None, thumbnail=None, state="info"):
     """Send only V2 components and explicitly referenced attachments, never embeds/content."""
     files = list(files)
+    if error or state == "error":
+        mark_status("error")
     try:
-        views = build_response_views(title, body, footer=footer, error=error, accent=accent, files=files, thumbnail=thumbnail)
+        views = build_response_views(title, body, footer=footer, error=error, accent=accent, files=files, thumbnail=thumbnail, state=state)
         for index, view in enumerate(views):
             kwargs = {'view': view, 'allowed_mentions': discord.AllowedMentions.none()}
             if index == 0 and files:
@@ -56,6 +58,7 @@ async def send_card(send, title, body, *, footer=None, error=False, accent=None,
             if ephemeral is not None:
                 kwargs['ephemeral'] = ephemeral
             await send(**kwargs)
+            mark_delivery()
     finally:
         for file in files:
             file.close()
@@ -186,6 +189,7 @@ async def send_production_card(send, item_name, body, *, wiki_context="", footer
     if ephemeral is not None:
         kwargs["ephemeral"] = ephemeral
     await send(**kwargs)
+    mark_delivery()
 
 
 def _factory_link(label, source):
@@ -196,69 +200,172 @@ def _factory_link(label, source):
     return label + " (source link missing)"
 
 
-def build_factory_views(plan):
-    """Paginate complete stages without cutting a wiki link or hiding a branch."""
+
+def _factory_pages(plan):
+    """Separate the overview from short, independently browsable detail pages."""
     def rate(value):
         return f"{float(value):.6g}"
 
-    blocks = [
-        f"**Target:** {_factory_link(plan.target.name, plan.target.source)} · {rate(plan.rate)}/min\n"
-        + ("**Partial plan — missing wiki data below.**\n" if not plan.complete else "")
-        + "Input rates match the target; rounded machines have spare capacity. "
-          "Machine counts cover production, excluding machine construction materials."
-    ]
-    heading = "Known machine totals (partial)" if not plan.complete else "Machine totals"
-    blocks.append(f"**{heading} · {sum(plan.machine_totals.values()):,}**")
-    for machine, count in sorted(plan.machine_totals.items()):
-        blocks.append(f"• {count:,} × {_factory_link(machine, plan.machine_sources.get(machine))}")
-    blocks.append("**Raw-material / external inputs · per minute**")
-    if not plan.inputs:
-        blocks.append("No resolved raw inputs. Check missing wiki data below.")
-    for stage in sorted(plan.inputs, key=lambda s: s.recipe.name):
-        label = "" if stage.recipe.raw else " · acquisition unverified"
-        blocks.append(f"• {_factory_link(stage.recipe.name, stage.recipe.source)} · {rate(stage.required)}/min{label}")
-    blocks.append("**Production stages · upstream → final**")
+    partial = "**Partial plan · check Notes for missing data.**\n\n" if not plan.complete else ""
+    target = _factory_link(plan.target.name, plan.target.source)
+    final = next((s for s in plan.stages if s.recipe.path == plan.target.path), None)
+    overview = (
+        f"{partial}{target}\n**{rate(plan.rate)} / min** · {rate(plan.rate * 60)} / hour\n\n"
+        f"**{sum(plan.machine_totals.values()):,} {'known ' if not plan.complete else ''}machines** · "
+        f"{len(plan.machine_totals)} types\n"
+        f"**{len(plan.stages)} production stages** · {len(plan.inputs)} raw / external inputs"
+    )
+    if final:
+        count = f"{final.machines:,}" if final.machines is not None else "Unknown"
+        overview += (
+            "\n\n**Final assembly**\n"
+            f"{count} × {_factory_link(final.recipe.machine or 'Machine unknown', plan.machine_sources.get(final.recipe.machine))}"
+        )
+    overview += "\n\nChoose a section below to see the breakdown."
+    pages = [("Overview", overview)]
+
+    def section(name, rows, size=6):
+        rows = rows or ["No verified data available."]
+        current = []
+        for row in rows:
+            if len(row) > BODY_LIMIT:
+                raise ValueError("A wiki record is too long for a production card.")
+            if current and (len(current) >= size or len("\n\n".join(current + [row])) > 2500):
+                pages.append((name, "\n\n".join(current)))
+                current = []
+            current.append(row)
+        if current:
+            pages.append((name, "\n\n".join(current)))
+
+    section("Inputs", [
+        f"**{rate(s.required)} / min** · {_factory_link(s.recipe.name, s.recipe.source)}"
+        + ("\n-# Acquisition unverified in the wiki." if not s.recipe.raw else "")
+        for s in sorted(plan.inputs, key=lambda s: s.recipe.name)
+    ])
+    section("Machines", [
+        f"**{count:,} ×** {_factory_link(machine, plan.machine_sources.get(machine))}"
+        for machine, count in sorted(plan.machine_totals.items(), key=lambda pair: (-pair[1], pair[0]))
+    ], size=8)
+
+    from tools.factory_calculator import normalize
+    consumers = {}
+    for downstream in plan.stages:
+        for ingredient, _quantity in downstream.recipe.ingredients:
+            consumers.setdefault(normalize(ingredient), []).append(downstream.recipe.name)
+    stage_rows = []
     for index, stage in enumerate(plan.stages, 1):
         recipe = stage.recipe
-        count = f"{stage.machines:,}" if stage.machines is not None else "unknown count"
-        published = f"{rate(recipe.rate)}/min each" if recipe.rate else "rate missing"
-        machine = discord.utils.escape_markdown(recipe.machine or "machine missing")
-        blocks.append(
-            f"**{index}.** {_factory_link(recipe.name, recipe.source)} · **{rate(stage.required)}/min**\n"
-            f"{count} × {machine} · {published}"
+        final_output = recipe.path == plan.target.path
+        heading = "Final output" if final_output else f"Stage {index}"
+        count = f"{stage.machines:,}" if stage.machines is not None else "Unknown count"
+        destinations = list(dict.fromkeys(consumers.get(normalize(recipe.name), [])))
+        usage = ", ".join(discord.utils.escape_markdown(name) for name in destinations[:3])
+        if len(destinations) > 3:
+            usage += f" + {len(destinations) - 3} other stages"
+        stage_rows.append(
+            f"**{heading} ·** {_factory_link(recipe.name, recipe.source)}\n"
+            f"Make **{rate(stage.required)} per minute total**\n"
+            f"Use **{count} × {discord.utils.escape_markdown(recipe.machine or 'machine unknown')}**"
+            + (f"\n-# Supplies: {usage}" if usage and not final_output else "")
         )
-    if plan.placements:
-        blocks.append("**Machine placement · stated in wiki**")
-        for machine, placement in plan.placements:
-            blocks.append(f"• {_factory_link(machine, plan.machine_sources.get(machine))}: {discord.utils.escape_markdown(placement)}")
-    if plan.issues:
-        blocks.append("**Missing wiki data**")
-        blocks.extend("• " + discord.utils.escape_markdown(issue) for issue in dict.fromkeys(plan.issues))
-    pages, current = [], []
-    for block in blocks:
-        # Individual records stay intact; imported note names/URLs are bounded.
-        if len(block) > BODY_LIMIT:
-            raise ValueError("A wiki record is too long for a production card.")
-        if current and (sum(map(len, current)) + len(current) * 2 + len(block) > 2700 or len(current) >= 10):
-            pages.append("\n\n".join(current))
-            current = []
-        current.append(block)
-    if current:
-        pages.append("\n\n".join(current))
-    return [
-        build_layout_view("response_card", {
-            "title": f"Full factory · {plan.target.name[:100]} · {index + 1}/{len(pages)}",
-            "body": body,
-            "footer": "Capital Rift local wiki · Published recipe rates · Demand combined before rounding",
-            "accent_color": ORANGE if not plan.complete else GOLD,
-        })
-        for index, body in enumerate(pages)
+    section("Stages", stage_rows, size=3)
+    notes = [
+        "**How to read this plan**\nInput rates match your target. Rounded machines have spare capacity. "
+        "Shared ingredient demand is combined before rounding.",
+        "Machine totals cover ongoing production. Materials for constructing the machines are excluded.",
     ]
+    notes.extend(
+        f"**Machine placement**\n{_factory_link(machine, plan.machine_sources.get(machine))}: "
+        f"{discord.utils.escape_markdown(placement)}"
+        for machine, placement in plan.placements
+    )
+    if plan.issues:
+        notes = ["**Missing wiki data**\n" + discord.utils.escape_markdown(issue)
+                 for issue in dict.fromkeys(plan.issues)] + notes
+    section("Notes", notes)
+    return pages
+
+
+def _factory_page_view(plan, pages, index):
+    section = pages[index][0]
+    siblings = [i for i, page in enumerate(pages) if page[0] == section]
+    suffix = f" · {siblings.index(index) + 1}/{len(siblings)}" if len(siblings) > 1 else ""
+    footer = (("Partial plan · see Notes. " if not plan.complete else "")
+              + "Upstream parts first. Separate branches can run in parallel.") if section == "Stages" else (
+                  "Partial plan · see Notes" if not plan.complete else "Capital Rift Wiki · All rates per minute")
+    return build_card(
+        f"{plan.target.name[:90]} · {section}{suffix}", pages[index][1],
+        footer=footer, state="warning" if not plan.complete else "info",
+    )
+
+
+
+def build_factory_views(plan):
+    """Return all detail views for validation; delivery starts with overview only."""
+    pages = _factory_pages(plan)
+    return [_factory_page_view(plan, pages, index) for index in range(len(pages))]
+
+
+class FactoryPlanView(discord.ui.LayoutView):
+    """Browse one factory result in place instead of posting a chain of messages."""
+    def __init__(self, plan, *, pages=None, index=0):
+        super().__init__(timeout=900)
+        self.plan = plan
+        self.pages = pages if pages is not None else _factory_pages(plan)
+        self.index = index
+        self.message = None
+        base = _factory_page_view(plan, self.pages, index)
+        for child in list(base.children):
+            base.remove_item(child)
+            self.add_item(child)
+        section = self.pages[index][0]
+        tabs = discord.ui.ActionRow()
+        for name in dict.fromkeys(page[0] for page in self.pages):
+            target = next(i for i, page in enumerate(self.pages) if page[0] == name)
+            label = "Notes !" if name == "Notes" and not plan.complete else name
+            button = discord.ui.Button(
+                label=label, style=discord.ButtonStyle.primary if name == section else discord.ButtonStyle.secondary,
+                disabled=name == section,
+            )
+            button.callback = self._navigate(target)
+            tabs.add_item(button)
+        self.add_item(tabs)
+        siblings = [i for i, page in enumerate(self.pages) if page[0] == section]
+        position = siblings.index(index)
+        if len(siblings) > 1:
+            controls = discord.ui.ActionRow()
+            for label, offset in (("Previous", -1), ("Next", 1)):
+                destination = position + offset
+                disabled = not 0 <= destination < len(siblings)
+                button = discord.ui.Button(label=label, disabled=disabled)
+                button.callback = self._navigate(siblings[destination] if not disabled else index)
+                controls.add_item(button)
+            self.add_item(controls)
+
+    def _navigate(self, index):
+        async def callback(interaction):
+            view = FactoryPlanView(self.plan, pages=self.pages, index=index)
+            await interaction.response.edit_message(view=view, allowed_mentions=discord.AllowedMentions.none())
+            view.message = interaction.message
+            self.stop()
+        return callback
+
+    async def on_timeout(self):
+        for item in self.walk_children():
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        self.add_item(discord.ui.TextDisplay("-# Controls expired. Run /factory again to browse this plan."))
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                pass
 
 
 async def send_factory_plan(send, plan, *, ephemeral=None):
-    for view in build_factory_views(plan):
-        kwargs = {"view": view, "allowed_mentions": discord.AllowedMentions.none()}
-        if ephemeral is not None:
-            kwargs["ephemeral"] = ephemeral
-        await send(**kwargs)
+    view = FactoryPlanView(plan)
+    kwargs = {"view": view, "allowed_mentions": discord.AllowedMentions.none()}
+    if ephemeral is not None:
+        kwargs["ephemeral"] = ephemeral
+    view.message = await send(**kwargs)
+    mark_delivery()

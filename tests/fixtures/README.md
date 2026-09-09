@@ -1,0 +1,1 @@
+factory_wiki.json contains the 47 local Capital Rift wiki notes needed by the Computer and Bucket-Wheel Excavator calculator regression tests, captured on 2026-09-08. Each note retains its public source URL and imported recipe values. Personal notes are excluded. Tests use this fixed snapshot without accessing the live vault or network.

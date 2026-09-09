@@ -13,6 +13,7 @@ approximation, best for simple looping animations (a character waving, a
 scene subtly shifting) rather than complex continuous motion.
 """
 import io
+import asyncio
 from PIL import Image
 
 from tools.image_gen import generate_image
@@ -32,8 +33,15 @@ async def generate_gif(prompt: str, frames: int = DEFAULT_FRAMES) -> bytes:
     images = []
     for fp in frame_prompts:
         png_bytes = await generate_image(fp)
-        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-        images.append(img)
+        images.append(png_bytes)
+    return await asyncio.to_thread(_encode_frames, images)
+
+
+def _encode_frames(frames):
+    images = []
+    for data in frames:
+        with Image.open(io.BytesIO(data)) as image:
+            images.append(image.convert("RGB"))
 
     # Normalize all frames to the same size (use the first frame's size)
     base_size = images[0].size

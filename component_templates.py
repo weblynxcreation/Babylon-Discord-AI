@@ -174,7 +174,8 @@ def build_layout_view(template_name: str, values: Mapping[str, Any]):
     view = discord.ui.LayoutView()
     for component in payload["components"]:
         view.add_item(_build_component(discord, component))
-    return view
+    from card_primitives import validate_view
+    return validate_view(view)
 
 
 def _build_component(discord: Any, component: Mapping[str, Any]):

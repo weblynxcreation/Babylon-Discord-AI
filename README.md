@@ -344,3 +344,46 @@ the gateway bot runs on a persistent worker host.
   databases, virtual environments, or generated archives.
 - Rotate any credential that has appeared in an earlier ZIP or Git history.
 - The Discord bot must never receive or store a Capital Rift session cookie.
+
+## Full factory calculator
+
+Mention the bot, use `/ask`, or pass a scaled request to `/factory`:
+
+- `/factory item:Computer amount:1`
+- `/factory item:Bucket Wheel Excavators amount:0.1`
+- `/ask Build me the full production chain for 10 computers per hour`
+
+The /factory command has separate item and optional numeric amount fields.
+Amount is output per minute; omit it for the basic factory lookup.
+
+Scaled requests and requests for a full chain/from raw components use a
+deterministic calculator over the local Obsidian wiki. A full-chain request
+without a rate asks for the missing scale. Ordinary `/factory Computer` and
+other unscaled lookups retain their existing production cards.
+
+The calculator expands ingredient recipes to raw or external inputs, combines
+shared intermediate demand, and rounds each recipe's machine count up once.
+Hourly rates are converted to per-minute demand. Machine totals sum those
+dedicated recipe counts; rounded machines may have spare capacity. Input rates
+cover ongoing production at the target, not construction of the machines.
+
+Cards show machine totals, raw input rates, every intermediate stage, and
+clickable source links. The bot sends one compact overview card. Inputs, Machines,
+Stages, and Notes buttons browse details in the same message; stages show three
+at a time, with explicit output, machine, and downstream-use labels, with Previous/Next controls. Links remain clickable. Controls expire
+after 15 minutes of inactivity; rerun the command to reopen the plan. Placement notes come only from the actual machine's wiki
+metadata. Missing quantities, rates, machines, or notes produce a clearly marked
+partial plan. A recipe-less item is an external input; it is called raw only
+when its wiki description supports that classification. Cycles and ambiguous
+recipe choices are reported rather than filled in by the AI.
+
+Implementation: `tools/factory_calculator.py`, `response_cards.py`, and
+`knowledge/obsidian_vault.py`. Offline regressions and pinned local wiki notes
+are in `tests/test_factory_calculator.py` and `tests/fixtures/factory_wiki.json`.
+
+## Reliability and shared cards
+
+See [response reliability and logging](docs/RELIABILITY.md) for deadline/recovery
+behavior, correlation IDs, and bounded log retention. See the
+[Components V2 guide](docs/COMPONENTS_V2.md) for reusable card states, pagination,
+buttons, accessibility, and contribution conventions.

@@ -14,6 +14,7 @@ from uuid import uuid4
 from openai import AsyncOpenAI, APITimeoutError
 
 from reliability import chat_model, timeout_seconds
+from observability import current_trace, event as write_event
 
 from tools.web_search import web_search, TOOL_SCHEMA as WEB_SEARCH_SCHEMA
 from tools.web_scrape import scrape_url, TOOL_SCHEMA as WEB_SCRAPE_SCHEMA
@@ -172,19 +173,18 @@ class AgentResult:
         self.zip_path: str | None = None
         self.wiki_context: str = ""
         self.factory_plan = None
+        self.turn_id = ""
 
 
 def _event(event: str, turn_id: str, started: float, **fields) -> None:
-    # Never log prompts, tool arguments/results, provider exception text, or secrets.
-    log.info(json.dumps({
-        "event": event, "turn_id": turn_id,
-        "elapsed_ms": round((monotonic() - started) * 1000), **fields,
-    }))
+    write_event(log, event, turn_id, started, **fields)
 
 
 async def _invoke_tool(name, args, *, turn_id, round_number, timeout):
     started = monotonic()
-    _event("tool_started", turn_id, started, round=round_number, tool=name)
+    safe_name = name if name in TOOL_IMPLS else "unknown"
+    call_id = uuid4().hex[:12]
+    _event("tool_started", turn_id, started, round=round_number, tool=safe_name, call_id=call_id)
     status = "completed"
     try:
         if not isinstance(args, dict):
@@ -216,7 +216,7 @@ async def _invoke_tool(name, args, *, turn_id, round_number, timeout):
         detail = str(exc) if isinstance(exc, (ValueError, TypeError)) else type(exc).__name__
         return json.dumps({"error": f"Tool failed: {detail}"}), status
     finally:
-        _event("tool_finished", turn_id, started, round=round_number, tool=name, status=status)
+        _event("tool_finished", turn_id, started, round=round_number, tool=safe_name, call_id=call_id, status=status)
 
 
 def _answer_only_messages(messages):
@@ -295,74 +295,90 @@ async def _run_turn(history, user_message, max_tool_rounds, result, turn_id):
     for round_number in range(1, max_tool_rounds + 2):
         final_round = round_number > max_tool_rounds
         started = monotonic()
-        _event("model_started", turn_id, started, round=round_number, model=model, final=final_round)
-        status = "completed"
-        request = {
-            "model": model,
-            "messages": _answer_only_messages(messages) if final_round else messages,
-            "temperature": 0.7, "max_tokens": 2048, "timeout": request_timeout,
-        }
-        if not final_round:
-            request.update(tools=TOOLS, tool_choice="auto")
+        round_status = "completed"
         try:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(**request), timeout=request_timeout,
-            )
-            msg = response.choices[0].message
+            _event("model_started", turn_id, started, round=round_number, model=model, final=final_round)
+            status = "completed"
+            request = {
+                "model": model,
+                "messages": _answer_only_messages(messages) if final_round else messages,
+                "temperature": 0.7, "max_tokens": 2048, "timeout": request_timeout,
+            }
+            if not final_round:
+                request.update(tools=TOOLS, tool_choice="auto")
+            try:
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(**request), timeout=request_timeout,
+                )
+                msg = response.choices[0].message
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
+            except (asyncio.TimeoutError, APITimeoutError):
+                status = "timeout"
+                raise
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                _event("model_finished", turn_id, started, round=round_number, status=status)
+
+            calls = msg.tool_calls or []
+            _event("round_response", turn_id, started, round=round_number,
+                   tools=[tc.function.name if tc.function.name in TOOL_IMPLS else "unknown" for tc in calls], final=final_round)
+            if not calls:
+                result.text = msg.content or "I couldn't generate a response. Please try again."
+                result.status = "completed" if msg.content else "empty"
+                round_status = result.status
+                return
+            if final_round:
+                result.status = "tool_limit"
+                round_status = "tool_limit"
+                result.text = "I reached the tool limit before finishing. Please narrow the request and try again."
+                return
+
+            messages.append({
+                "role": "assistant", "content": msg.content or "",
+                "tool_calls": [{
+                    "id": tc.id, "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                } for tc in calls],
+            })
+            for tc in calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    args = None  # Report invalid JSON, never execute with invented defaults.
+                output, tool_status = await _invoke_tool(
+                    name, args, turn_id=turn_id, round_number=round_number, timeout=tool_timeout,
+                )
+                if tool_status != "completed":
+                    round_status = tool_status
+                if tool_status == "completed" and name == "generate_image" and isinstance(output, (bytes, bytearray)):
+                    result.image_bytes = bytes(output)
+                    tool_text = "Image generated successfully and will be shown to the user."
+                elif tool_status == "completed" and name == "generate_gif" and isinstance(output, (bytes, bytearray)):
+                    result.gif_bytes = bytes(output)
+                    tool_text = "GIF generated successfully and will be shown to the user."
+                elif tool_status == "completed" and name == "package_files" and isinstance(output, str):
+                    result.zip_path = output
+                    tool_text = "Files packaged successfully and will be attached."
+                else:
+                    tool_text = str(output)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_text})
         except asyncio.CancelledError:
-            status = "cancelled"
+            round_status = "cancelled"
             raise
         except (asyncio.TimeoutError, APITimeoutError):
-            status = "timeout"
+            round_status = "timeout"
             raise
         except Exception:
-            status = "error"
+            round_status = "error"
             raise
         finally:
-            _event("model_finished", turn_id, started, round=round_number, status=status)
+            _event("round_finished", turn_id, started, round=round_number, status=round_status)
 
-        calls = msg.tool_calls or []
-        _event("round_response", turn_id, started, round=round_number,
-               tools=[tc.function.name for tc in calls], final=final_round)
-        if not calls:
-            result.text = msg.content or "I couldn't generate a response. Please try again."
-            result.status = "completed" if msg.content else "empty"
-            _event("round_finished", turn_id, started, round=round_number, status=result.status)
-            return
-        if final_round:
-            result.status = "tool_limit"
-            result.text = "I reached the tool limit before finishing. Please narrow the request and try again."
-            return
-
-        messages.append({
-            "role": "assistant", "content": msg.content or "",
-            "tool_calls": [{
-                "id": tc.id, "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-            } for tc in calls],
-        })
-        for tc in calls:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except (json.JSONDecodeError, TypeError):
-                args = None  # Report invalid JSON, never execute with invented defaults.
-            output, tool_status = await _invoke_tool(
-                name, args, turn_id=turn_id, round_number=round_number, timeout=tool_timeout,
-            )
-            if tool_status == "completed" and name == "generate_image" and isinstance(output, (bytes, bytearray)):
-                result.image_bytes = bytes(output)
-                tool_text = "Image generated successfully and will be shown to the user."
-            elif tool_status == "completed" and name == "generate_gif" and isinstance(output, (bytes, bytearray)):
-                result.gif_bytes = bytes(output)
-                tool_text = "GIF generated successfully and will be shown to the user."
-            elif tool_status == "completed" and name == "package_files" and isinstance(output, str):
-                result.zip_path = output
-                tool_text = "Files packaged successfully and will be attached."
-            else:
-                tool_text = str(output)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_text})
-        _event("round_finished", turn_id, started, round=round_number, status="completed")
 
 
 async def run_agent(history: list[dict], user_message: str, max_tool_rounds: int = 4) -> AgentResult:
@@ -371,7 +387,9 @@ async def run_agent(history: list[dict], user_message: str, max_tool_rounds: int
         raise ValueError("max_tool_rounds must be a non-negative integer.")
     deadline = timeout_seconds("AGENT_TURN_TIMEOUT_SECONDS", 120)
     result = AgentResult()
-    turn_id = uuid4().hex[:12]
+    trace = current_trace.get()
+    turn_id = trace.turn_id if trace else uuid4().hex[:12]
+    result.turn_id = turn_id
     started = monotonic()
     _event("turn_started", turn_id, started, model=chat_model(), timeout_seconds=deadline)
     try:
@@ -383,7 +401,7 @@ async def run_agent(history: list[dict], user_message: str, max_tool_rounds: int
         raise
     except (asyncio.TimeoutError, APITimeoutError):
         result.status = "timeout"
-        result.text = "This request took too long, so I stopped it. Please try again or ask a smaller question."
+        result.text = f"This request took too long, so I stopped it. Please try again or ask a smaller question. Ref: {turn_id}"
     except Exception as exc:
         result.status = "error"
         _event("turn_error", turn_id, started, error_type=type(exc).__name__)

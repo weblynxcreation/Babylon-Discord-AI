@@ -44,11 +44,16 @@ load_dotenv()
 from response_cards import GREEN, ORANGE, send_card, send_production_card
 from wiki_cards import linked_wiki_card
 from response_cards import send_factory_plan
-from tools.factory_calculator import FactoryError, full_factory_request, parse_factory_request, plan_factory
+from tools.factory_calculator import FactoryRequest, FactoryError, full_factory_request, parse_factory_request, plan_factory
 from knowledge.obsidian_vault import VaultError
 from reliability import timeout_seconds
+from observability import current_trace, mark_delivery, mark_status, trace_event, diagnostic_excerpt, configure_logging
+from response_lifecycle import bounded_command, bounded_message, typing_scope, recover_response
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+if __name__ == "__main__" and not logging.getLogger().handlers:
+    configure_logging(Path(__file__).resolve().parent / "logs")
+else:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("discord-ai-agent")
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
@@ -77,37 +82,49 @@ DISCORD_FILE_SIZE_LIMIT = 8 * 1024 * 1024  # 8MB default (non-boosted) server li
 
 class TimeoutLogView(discord.ui.View):
     """One-click, redacted diagnostic delivery for a timed-out request."""
-    def __init__(self, source):
+    def __init__(self, source, turn_id=None):
         super().__init__(timeout=300)
         self.source = source
+        self.turn_id = turn_id
 
     @discord.ui.button(label="Send logs", style=discord.ButtonStyle.secondary, emoji="📄")
     async def send_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await asyncio.wait_for(self._send_diagnostics(interaction), timeout=15)
+        except asyncio.CancelledError:
+            await recover_response(interaction, "Diagnostic request cancelled. Please try again.", interaction=True)
+            raise
+        except Exception:
+            await recover_response(interaction, "I could not send diagnostics. Please try again.", interaction=True)
+
+    async def _send_diagnostics(self, interaction):
         guild = getattr(interaction, "guild", None)
         target = None
         if guild is not None:
             config = await mod_store.get_guild_config(guild.id)
             target = guild.get_channel(config.get("mod_log_channel_id") or 0)
-            if target is None:
-                target = next((channel for channel in guild.text_channels if channel.name.casefold() in {"errors", "logs", "bot-logs"}), None)
         if target is None:
-            target = getattr(self.source, "channel", self.source)
-        log_path = Path("logs/local-bot.log")
-        text = log_path.read_text(encoding="utf-8", errors="replace")[-18000:] if log_path.exists() else "No local log file was found."
-        for name in ("DISCORD_BOT_TOKEN", "NVIDIA_API_KEY", "TAVILY_API_KEY"):
-            secret = os.environ.get(name, "").strip()
-            if secret:
-                text = text.replace(secret, "[REDACTED]")
-        payload = io.BytesIO(text.encode("utf-8", errors="replace"))
+            await interaction.followup.send("No diagnostic log channel is configured.", ephemeral=True)
+            return
+        text = await asyncio.to_thread(diagnostic_excerpt, Path("logs/local-bot.log"), self.turn_id)
+        payload = io.BytesIO(text.encode("utf-8"))
+        file = discord.File(payload, filename="babylon-timeout-log.txt")
         try:
-            await target.send(content=f"Timeout diagnostics requested by {interaction.user.mention}.", file=discord.File(payload, filename="babylon-timeout-log.txt"))
-            await interaction.response.send_message(f"Logs sent to {target.mention}.", ephemeral=True)
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.response.send_message("I could not send the logs to the configured log channel.", ephemeral=True)
+            await target.send(content="Request diagnostics" + (f" · {self.turn_id}" if self.turn_id else ""),
+                              file=file, allowed_mentions=discord.AllowedMentions.none())
+            await interaction.followup.send(f"Diagnostics sent to {target.mention}.", ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+        finally:
+            file.close()
 
 
 async def _send_agent_result(channel_or_interaction, result, followup: bool = False, *, card: bool = False, factory: bool = False, factory_name: str = "Factory setup"):
-    """Send Components V2 cards with generated images and file attachments."""
+    """Deliver conversational text or structured cards and record terminal status."""
+    mark_status(result.status)
+    trace = current_trace.get()
+    if not getattr(result, "turn_id", "") and trace:
+        result.turn_id = trace.turn_id
     files = []
     if result.image_bytes:
         files.append(discord.File(io.BytesIO(result.image_bytes), filename="generated.png"))
@@ -120,13 +137,17 @@ async def _send_agent_result(channel_or_interaction, result, followup: bool = Fa
         else:
             result.text += f"\n\n⚠️ The generated project ({size // 1024}KB) is too large to attach here."
 
-    send = channel_or_interaction.followup.send if followup else channel_or_interaction.send
+    destination = channel_or_interaction.followup.send if followup else channel_or_interaction.send
+    async def send(**kwargs):
+        sent = await destination(**kwargs)
+        mark_delivery()
+        return sent
     try:
         if result.status == "timeout":
-            # Classic message: the timeout diagnostics button cannot live in a V2 layout.
+            # Conversational timeout stays plain text with a classic diagnostics button.
             await send(
                 content=(result.text or "The request ran out of time.")[:1900],
-                view=TimeoutLogView(channel_or_interaction),
+                view=TimeoutLogView(channel_or_interaction, getattr(result, "turn_id", None)),
                 allowed_mentions=discord.AllowedMentions.none(),
                 files=files,
             )
@@ -165,7 +186,7 @@ async def _mod_log(guild: discord.Guild, text: str) -> None:
     config = await mod_store.get_guild_config(guild.id)
     channel_id = config.get("mod_log_channel_id")
     if not channel_id:
-        log.info(f"[mod-log:{guild.name}] {text}")
+        log.info("Moderation event: no diagnostic channel configured")
         return
     channel = guild.get_channel(channel_id)
     if channel:
@@ -174,7 +195,7 @@ async def _mod_log(guild: discord.Guild, text: str) -> None:
         except discord.Forbidden:
             log.warning(f"Missing permission to post in mod-log channel for {guild.name}")
     else:
-        log.info(f"[mod-log:{guild.name}] {text}")
+        log.info("Moderation event: no diagnostic channel configured")
 
 
 @client.event
@@ -254,12 +275,13 @@ async def _deterministic_wiki_count_result():
     return result
 
 
-async def _deterministic_factory_result(request: str):
+async def _deterministic_factory_result(request: str, *, amount: float | None = None):
     """Wiki-only factory lookup: no model output between the note and the card."""
     result = AgentResult()
-    if full_factory_request(request):
+    if amount is not None or full_factory_request(request):
         try:
-            parsed = parse_factory_request(request)
+            from fractions import Fraction
+            parsed = FactoryRequest(request.strip(), Fraction(str(amount))) if amount is not None else parse_factory_request(request)
             result.factory_plan = await asyncio.wait_for(
                 plan_factory(parsed),
                 timeout=timeout_seconds("AGENT_TURN_TIMEOUT_SECONDS", 120),
@@ -331,10 +353,15 @@ async def on_message(message: discord.Message):
     if not content:
         return
 
+    await _respond_to_message(message, content)
+
+
+@bounded_message
+async def _respond_to_message(message, content):
     is_factory = _wants_factory_card(content)
-    history = await chat_history.get_history(message.channel.id, limit=HISTORY_LIMIT)
     try:
-        async with message.channel.typing():
+        async with typing_scope(message.channel):
+            history = await chat_history.get_history(message.channel.id, limit=HISTORY_LIMIT)
             if _wants_overbroad_request(content):
                 result = _overbroad_result()
             elif _wants_wiki_count(content):
@@ -344,7 +371,7 @@ async def on_message(message: discord.Message):
             else:
                 result = await run_agent(history, content)
     except Exception:
-        log.exception("Agent run failed")
+        trace_event("handler_error", status="error")
         await send_card(
             message.channel.send, "Request incomplete",
             "I couldn't complete this request. Please try again in a moment.", error=True,
@@ -364,6 +391,7 @@ async def on_message(message: discord.Message):
 
 @tree.command(name="ask", description="Ask the AI agent a one-off question (with live web search).")
 @app_commands.describe(question="What do you want to ask?")
+@bounded_command
 async def ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     is_factory = _wants_factory_card(question)
@@ -377,8 +405,8 @@ async def ask(interaction: discord.Interaction, question: str):
         else:
             result = await run_agent([], question)
     except Exception as e:
-        log.exception("Agent run failed")
-        await send_card(interaction.followup.send, "Request failed", f"Something went wrong: `{e}`", error=True)
+        trace_event("handler_error", status="error")
+        await send_card(interaction.followup.send, "Request failed", "I could not complete this request. Please try again.", error=True)
         return
     await _send_agent_result(
         interaction, result, followup=True, card=is_factory, factory=is_factory,
@@ -394,7 +422,7 @@ async def _market_companies(interaction: discord.Interaction):
     try:
         return await market_client.get_companies()
     except BabylonAPIError as exc:
-        log.warning("Babylon market request failed: %s", exc)
+        trace_event("market_error", status="error", error_type=type(exc).__name__)
         await send_card(
             interaction.followup.send, "Market unavailable",
             f"Market data is unavailable: {exc}", error=True, ephemeral=True,
@@ -407,6 +435,7 @@ def _company_url(company_id: str) -> str:
 
 
 @tree.command(name="market", description="Show a live overview of the Babylon Stock Market.")
+@bounded_command
 async def market(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     companies = await _market_companies(interaction)
@@ -444,6 +473,7 @@ async def market(interaction: discord.Interaction):
 
 @tree.command(name="stock", description="Look up a company on the Babylon Stock Market.")
 @app_commands.describe(company="Company name")
+@bounded_command
 async def stock(interaction: discord.Interaction, company: str):
     await interaction.response.defer(thinking=True)
     companies = await _market_companies(interaction)
@@ -501,6 +531,7 @@ async def stock_autocomplete(
         app_commands.Choice(name="Profit per minute", value="profit"),
     ]
 )
+@bounded_command
 async def leaders(
     interaction: discord.Interaction,
     metric: app_commands.Choice[str],
@@ -531,6 +562,7 @@ async def leaders(
 
 @tree.command(name="movers", description="Show the Babylon market's biggest gains and losses.")
 @app_commands.describe(limit="Number of gainers and losers to show")
+@bounded_command
 async def movers(
     interaction: discord.Interaction,
     limit: app_commands.Range[int, 1, 10] = 5,
@@ -563,6 +595,7 @@ async def movers(
 
 
 @tree.command(name="market-status", description="Check verification and synchronization health.")
+@bounded_command
 async def market_status(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     companies = await _market_companies(interaction)
@@ -604,26 +637,28 @@ async def market_status(interaction: discord.Interaction):
 
 @tree.command(name="image", description="Generate an image from a text prompt.")
 @app_commands.describe(prompt="Describe the image you want.")
+@bounded_command
 async def image(interaction: discord.Interaction, prompt: str):
     await interaction.response.defer(thinking=True)
     try:
         result = await run_agent([], f"Generate an image: {prompt}")
     except Exception as e:
-        log.exception("Image generation failed")
-        await send_card(interaction.followup.send, "Image failed", f"Something went wrong: `{e}`", error=True)
+        trace_event("handler_error", status="error")
+        await send_card(interaction.followup.send, "Image failed", "I could not complete this request. Please try again.", error=True)
         return
     await _send_agent_result(interaction, result, followup=True, card=True)
 
 
 @tree.command(name="gif", description="Generate a short animated GIF from a text prompt.")
 @app_commands.describe(prompt="Describe the animation/scene you want.")
+@bounded_command
 async def gif(interaction: discord.Interaction, prompt: str):
     await interaction.response.defer(thinking=True)
     try:
         result = await run_agent([], f"Generate an animated GIF: {prompt}")
     except Exception as e:
-        log.exception("GIF generation failed")
-        await send_card(interaction.followup.send, "GIF failed", f"Something went wrong: `{e}`", error=True)
+        trace_event("handler_error", status="error")
+        await send_card(interaction.followup.send, "GIF failed", "I could not complete this request. Please try again.", error=True)
         return
     await _send_agent_result(interaction, result, followup=True, card=True)
 
@@ -639,6 +674,7 @@ async def clearhistory(interaction: discord.Interaction):
 
 @tree.command(name="build", description="Generate code or a website and get it as a downloadable zip.")
 @app_commands.describe(description="Describe what you want built.")
+@bounded_command
 async def build(interaction: discord.Interaction, description: str):
     await interaction.response.defer(thinking=True)
     try:
@@ -647,8 +683,8 @@ async def build(interaction: discord.Interaction, description: str):
             f"Build the following and package it with package_files: {description}",
         )
     except Exception as e:
-        log.exception("Build failed")
-        await send_card(interaction.followup.send, "Build failed", f"Something went wrong: `{e}`", error=True)
+        trace_event("handler_error", status="error")
+        await send_card(interaction.followup.send, "Build failed", "I could not complete this request. Please try again.", error=True)
         return
     await _send_agent_result(interaction, result, followup=True, card=True)
 
@@ -808,6 +844,7 @@ async def config_reset(interaction: discord.Interaction, confirm: bool):
 @tree.command(name="wiki-status", description="Check the local Capital Rift wiki index.")
 @app_commands.guild_only()
 @bot_admin_only()
+@bounded_command
 async def wiki_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     payload = json.loads(await capital_rift_wiki("status"))
@@ -892,6 +929,7 @@ def _machine_name(note: str) -> str | None:
 
 @tree.command(name="item", description="Look up a Capital Rift item in the local wiki.")
 @app_commands.describe(name="Item name, for example Iron Plate")
+@bounded_command
 async def item_lookup(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(name, "item")
@@ -903,6 +941,7 @@ async def item_lookup(interaction: discord.Interaction, name: str):
 
 @tree.command(name="recipe", description="Look up a Capital Rift recipe in the local wiki.")
 @app_commands.describe(name="Recipe or output item name, for example Iron Plate")
+@bounded_command
 async def recipe_lookup(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(name, "recipe")
@@ -914,6 +953,7 @@ async def recipe_lookup(interaction: discord.Interaction, name: str):
 
 @tree.command(name="machine", description="Look up a Capital Rift production machine in the local wiki.")
 @app_commands.describe(name="Machine name, for example Furnace")
+@bounded_command
 async def machine_lookup(interaction: discord.Interaction, name: str):
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(name, "machine")
@@ -924,13 +964,21 @@ async def machine_lookup(interaction: discord.Interaction, name: str):
 
 
 @tree.command(name="factory", description="Create a wiki-grounded factory or production setup card.")
-@app_commands.describe(request="What should the factory produce?")
-async def factory(interaction: discord.Interaction, request: str):
+@app_commands.describe(
+    item="Item to produce, for example Computer or Bucket-Wheel Excavator",
+    amount="Output per minute (e.g. 1 or 0.1). Leave blank for a basic factory lookup.",
+)
+@bounded_command
+async def factory(
+    interaction: discord.Interaction,
+    item: str,
+    amount: app_commands.Range[float, 0.000001, 1000000.0] | None = None,
+):
     await interaction.response.defer(thinking=True)
-    result = await _deterministic_factory_result(request)
+    result = await _deterministic_factory_result(item, amount=amount)
     await _send_agent_result(
         interaction, result, followup=True, card=True, factory=True,
-        factory_name=_factory_subject(request),
+        factory_name=item,
     )
 
 
@@ -939,6 +987,7 @@ async def factory(interaction: discord.Interaction, request: str):
     item="Output item or recipe name, for example Iron Plate",
     target_per_minute="Desired output per minute",
 )
+@bounded_command
 async def production(interaction: discord.Interaction, item: str, target_per_minute: app_commands.Range[float, 0.001, 1000000.0]):
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(item, "recipe")
@@ -972,15 +1021,16 @@ async def production(interaction: discord.Interaction, item: str, target_per_min
 
 
 @tree.error
+@bounded_command
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
         message = str(error) or "You don't have permission to use this command."
         send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
         await send_card(send, "Command unavailable", message, error=True, ephemeral=True)
         return
-    log.exception("Slash command error", exc_info=error)
+    trace_event("handler_error", status="error")
     send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-    await send_card(send, "Command failed", f"Something went wrong: `{error}`", error=True, ephemeral=True)
+    await send_card(send, "Command failed", "I could not complete this command. Please try again.", error=True, ephemeral=True)
 
 
 @automod_group.command(name="toggle", description="Turn automod on or off for this server.")
@@ -1221,6 +1271,7 @@ async def ban(interaction: discord.Interaction, member: discord.Member, reason: 
 
 @tree.command(name="purge", description="Delete a number of recent messages in this channel.")
 @app_commands.checks.has_permissions(manage_messages=True)
+@bounded_command
 async def purge(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100]):
     await interaction.response.defer(ephemeral=True, thinking=True)
     deleted = await interaction.channel.purge(limit=count)

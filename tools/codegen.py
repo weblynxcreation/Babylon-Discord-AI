@@ -1,47 +1,78 @@
-"""
-Code / website generation tool.
-
-The LLM calls this with a list of {path, content} files it has already
-written. This tool's only job is to materialize those files to disk and
-zip them for Discord delivery — it does NOT generate code itself. That
-keeps generation quality in the hands of the main model call (with full
-conversation context) rather than a second, context-blind call.
-"""
-import os
+import asyncio
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import tempfile
+import threading
+from uuid import uuid4
 import zipfile
-import shutil
-import time
 
-OUTPUT_ROOT = "/home/claude/discord-ai-agent/generated"
+OUTPUT_ROOT = str(Path(__file__).resolve().parent.parent / "data" / "generated")
+MAX_FILES = 64
+MAX_BYTES = 5 * 1024 * 1024
+
+
+def _package(project_name, files, cancelled):
+    if not isinstance(files, list) or not 1 <= len(files) <= MAX_FILES:
+        raise ValueError("Supply 1–64 files.")
+    root = Path(OUTPUT_ROOT).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(c for c in str(project_name) if c.isalnum() or c in "-_")[:60] or "project"
+    archive = root / f"{safe_name}-{uuid4().hex}.zip"
+    total = 0
+    paths = set()
+    try:
+        # Only files under this fresh generated directory can be cleaned up.
+        with tempfile.TemporaryDirectory(prefix="build-", dir=root) as tmp:
+            directory = Path(tmp).resolve()
+            directory.relative_to(root)
+            for item in files:
+                if cancelled.is_set():
+                    raise RuntimeError("Packaging cancelled.")
+                relative = str(item["path"]).replace("\\", "/")
+                path = PurePosixPath(relative)
+                if path.is_absolute() or PureWindowsPath(relative).drive or ".." in path.parts or not path.name:
+                    raise ValueError("Generated file paths must remain inside the project.")
+                destination = (directory / path).resolve()
+                destination.relative_to(directory)
+                if str(destination).casefold() in paths:
+                    raise ValueError("Duplicate generated file path.")
+                paths.add(str(destination).casefold())
+                data = item["content"].encode("utf-8")
+                total += len(data)
+                if total > MAX_BYTES:
+                    raise ValueError("Generated files exceed the 5 MiB limit.")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+                for path in directory.rglob("*"):
+                    if cancelled.is_set():
+                        raise RuntimeError("Packaging cancelled.")
+                    if path.is_file():
+                        zipped.write(path, path.relative_to(directory))
+        if cancelled.is_set():
+            raise RuntimeError("Packaging cancelled.")
+        return str(archive)
+    except BaseException:
+        archive.unlink(missing_ok=True)
+        raise
 
 
 async def package_files(project_name: str, files: list[dict]) -> str:
-    """
-    files: list of {"path": "index.html", "content": "..."}
-    Returns the path to a zip file containing the project.
-    """
-    safe_name = "".join(c for c in project_name if c.isalnum() or c in "-_") or "project"
-    ts = int(time.time())
-    project_dir = os.path.join(OUTPUT_ROOT, f"{safe_name}-{ts}")
-    os.makedirs(project_dir, exist_ok=True)
-
-    for f in files:
-        rel_path = f["path"].lstrip("/")
-        full_path = os.path.join(project_dir, rel_path)
-        os.makedirs(os.path.dirname(full_path) or project_dir, exist_ok=True)
-        with open(full_path, "w", encoding="utf-8") as fh:
-            fh.write(f["content"])
-
-    zip_path = f"{project_dir}.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, filenames in os.walk(project_dir):
-            for filename in filenames:
-                file_path = os.path.join(root, filename)
-                arcname = os.path.relpath(file_path, project_dir)
-                zf.write(file_path, arcname)
-
-    shutil.rmtree(project_dir)
-    return zip_path
+    """Keep disk/ZIP work off Discord's loop, clean late artifacts on cancellation."""
+    cancelled = threading.Event()
+    worker = asyncio.create_task(asyncio.to_thread(_package, project_name, files, cancelled))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancelled.set()
+        def cleanup(done):
+            try:
+                artifact = Path(done.result()).resolve()
+                artifact.relative_to(Path(OUTPUT_ROOT).resolve())
+                artifact.unlink(missing_ok=True)
+            except (Exception, asyncio.CancelledError):
+                pass
+        worker.add_done_callback(cleanup)
+        raise
 
 
 TOOL_SCHEMA = {

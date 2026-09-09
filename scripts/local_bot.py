@@ -12,6 +12,7 @@ os.chdir(ROOT)
 
 from dotenv import load_dotenv
 from reliability import chat_model, timeout_seconds
+from observability import configure_logging
 
 
 def main():
@@ -31,7 +32,7 @@ def main():
              or os.environ.get('OBSIDIAN_VAULT_PATH', '').strip())
     if not vault or not Path(vault).is_dir():
         errors.append('Set CAPITAL_RIFT_VAULT_PATH to your existing wiki folder in .env.')
-    for name, default in (('NVIDIA_REQUEST_TIMEOUT_SECONDS', 45), ('AGENT_TOOL_TIMEOUT_SECONDS', 45), ('AGENT_TURN_TIMEOUT_SECONDS', 120)):
+    for name, default in (('NVIDIA_REQUEST_TIMEOUT_SECONDS', 45), ('AGENT_TOOL_TIMEOUT_SECONDS', 45), ('AGENT_TURN_TIMEOUT_SECONDS', 120), ('DISCORD_RESPONSE_TIMEOUT_SECONDS', 150), ('DISCORD_RECOVERY_TIMEOUT_SECONDS', 5)):
         try:
             timeout_seconds(name, default)
         except ValueError as exc:
@@ -50,11 +51,7 @@ def main():
         return 0
     log_dir = ROOT / 'logs'
     log_dir.mkdir(exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(message)s',
-        handlers=[logging.StreamHandler(), logging.FileHandler(log_dir / 'local-bot.log', encoding='utf-8')],
-    )
+    configure_logging(log_dir)
     print('Starting bot. Press Ctrl+C to stop. Logs: logs/local-bot.log')
     runpy.run_path(str(ROOT / 'bot.py'), run_name='__main__')
     return 0

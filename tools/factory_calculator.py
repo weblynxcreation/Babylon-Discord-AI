@@ -106,7 +106,7 @@ def parse_recipe(note):
     if not recipe.has_recipe:
         # A recipe-less page is an external input, never silently assumed mineable.
         description = re.split(r"^## ", body, maxsplit=1, flags=re.M)[0]
-        recipe.raw = bool(re.search(r"\braw\b|\bdug from a surveyed deposit\b", description, re.I))
+        recipe.raw = bool(re.search(r"(?:^|\n|[.!?]\s+)raw\b|\bdug from a surveyed deposit\b", description, re.I))
         if not recipe.raw:
             recipe.issues.append("No recipe published; acquisition/raw-material status unverified.")
         return recipe
@@ -265,4 +265,5 @@ def calculate_factory(notes, request):
 async def plan_factory(request):
     from tools.capital_rift import _get_wiki_index
     notes = await _get_wiki_index().snapshot_notes()
-    return calculate_factory(notes, request)
+    import asyncio
+    return await asyncio.to_thread(calculate_factory, notes, request)
