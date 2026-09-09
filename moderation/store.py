@@ -32,6 +32,8 @@ DEFAULT_GUILD_CONFIG = {
     "raid_action": "kick",  # "kick", "ban", or "alert_only"
     "raid_mode_active": False,
     "warnings": {},  # {user_id_str: count}
+    # [{channel_id_str, message_id_str, emoji, role_id_str}]
+    "reaction_roles": [],
 }
 
 _lock = asyncio.Lock()

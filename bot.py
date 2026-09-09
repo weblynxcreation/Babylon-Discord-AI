@@ -1267,9 +1267,250 @@ async def raid_config(
     await send_card(interaction.response.send_message, "Raid protection settings", text, ephemeral=True)
 
 
+# ---------------------------------------------------------------------------
+# Configurable reaction roles
+# ---------------------------------------------------------------------------
+
+reactionroles_group = app_commands.Group(
+    name="reactionroles",
+    description="Configure self-service roles granted by reacting to a message.",
+)
+
+_CUSTOM_EMOJI_ID = re.compile(r"<:?[^:<>]+:(\d+)>")
+
+
+def _emoji_matches(stored: str, reacted: str) -> bool:
+    """Match stored emoji text against a raw-reaction emoji string."""
+    if not stored or not reacted:
+        return False
+    stored_id = _CUSTOM_EMOJI_ID.search(stored)
+    reacted_id = _CUSTOM_EMOJI_ID.search(reacted)
+    if stored_id and reacted_id:
+        return stored_id.group(1) == reacted_id.group(1)
+    return stored == reacted
+
+
+def _find_reaction_mapping(config: dict, channel_id: int, message_id: int, emoji: str) -> dict | None:
+    channel_key = str(channel_id)
+    message_key = str(message_id)
+    for entry in config.get("reaction_roles", []):
+        if (
+            entry.get("channel_id") == channel_key
+            and entry.get("message_id") == message_key
+            and _emoji_matches(str(entry.get("emoji", "")), emoji)
+        ):
+            return entry
+    return None
+
+
+def _reaction_role_issues(role: discord.Role, me: discord.Member) -> list[str]:
+    """Why this role cannot be used as a reaction role, empty when safe."""
+    issues = []
+    if role.is_default():
+        issues.append("@everyone cannot be a reaction role.")
+    if role.managed:
+        issues.append(f"{role.name} is managed by an integration and cannot be assigned.")
+    if me is not None and getattr(role, "position", 0) >= getattr(me.top_role, "position", 0):
+        issues.append(
+            f"{role.name} is not below my highest role ({me.top_role.name}); move my role higher first."
+        )
+    if me is not None and not me.guild_permissions.manage_roles:
+        issues.append("I need the Manage Roles permission.")
+    return issues
+
+
+def _parse_message_ref(ref: str) -> tuple[int, int] | tuple[None, None]:
+    """Accept a bare message ID or a discord.com message link."""
+    ref = (ref or "").strip()
+    match = re.search(r"channels/\d+/(\d+)/(\d+)", ref)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    if ref.isdigit():
+        return None, int(ref)
+    return None, None
+
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    await _handle_raw_reaction(payload, add=True)
+
+
+@client.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    await _handle_raw_reaction(payload, add=False)
+
+
+async def _handle_raw_reaction(payload: discord.RawReactionActionEvent, *, add: bool) -> None:
+    if payload.guild_id is None or payload.user_id == getattr(client.user, "id", None):
+        return
+    try:
+        config = await mod_store.get_guild_config(payload.guild_id)
+        entry = _find_reaction_mapping(
+            config, payload.channel_id, payload.message_id, str(payload.emoji)
+        )
+        if entry is None:
+            return
+        guild = client.get_guild(payload.guild_id)
+        member = payload.member if add else (guild.get_member(payload.user_id) if guild else None)
+        if guild is None or member is None or member.bot:
+            return
+        role = guild.get_role(int(entry["role_id"]))
+        if role is None or _reaction_role_issues(role, guild.me):
+            return
+        if add:
+            await member.add_roles(role, reason="Reaction role")
+        else:
+            await member.remove_roles(role, reason="Reaction role removed")
+    except discord.HTTPException:
+        log.warning("Reaction role update failed for guild %s", payload.guild_id)
+    except Exception:
+        log.exception("Reaction role handler error")
+
+
+@reactionroles_group.command(name="add", description="Map an emoji on a message to a self-service role.")
+@app_commands.describe(
+    message="Message ID or discord.com message link",
+    emoji="Emoji to watch for (custom emoji pasted as its :name:id form works)",
+    role="Role members receive when reacting",
+    channel="Channel containing the message (required for bare IDs)",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def reactionroles_add(
+    interaction: discord.Interaction,
+    message: str,
+    emoji: str,
+    role: discord.Role,
+    channel: discord.TextChannel | None = None,
+):
+    link_channel_id, link_message_id = _parse_message_ref(message)
+    channel_id = link_channel_id or (channel.id if channel is not None else None)
+    message_id = link_message_id
+    if channel_id is None or message_id is None:
+        await send_card(
+            interaction.response.send_message, "Message needed",
+            "Pass a discord.com message link, or a bare message ID together with the `channel` option.",
+            error=True, ephemeral=True,
+        )
+        return
+
+    issues = _reaction_role_issues(role, interaction.guild.me)
+    if issues:
+        await send_card(
+            interaction.response.send_message, "Role not usable",
+            "\n".join(f"- {issue}" for issue in issues), error=True, ephemeral=True,
+        )
+        return
+
+    target_channel = interaction.guild.get_channel(channel_id)
+    if target_channel is None:
+        await send_card(
+            interaction.response.send_message, "Channel not found",
+            f"I can't see channel {channel_id}. Check the link or pass `channel`.",
+            error=True, ephemeral=True,
+        )
+        return
+
+    try:
+        target_message = await target_channel.fetch_message(message_id)
+        await target_message.add_reaction(emoji)
+    except discord.HTTPException as exc:
+        await send_card(
+            interaction.response.send_message, "Message not reachable",
+            f"I couldn't read that message or react with `{emoji}`: {exc}",
+            error=True, ephemeral=True,
+        )
+        return
+
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    mappings = [
+        entry for entry in config["reaction_roles"]
+        if not (str(entry.get("channel_id")) == str(channel_id)
+                and str(entry.get("message_id")) == str(message_id)
+                and _emoji_matches(str(entry.get("emoji", "")), emoji))
+    ]
+    mappings.append({
+        "channel_id": str(channel_id),
+        "message_id": str(message_id),
+        "emoji": emoji,
+        "role_id": str(role.id),
+    })
+    await mod_store.update_guild_config(interaction.guild_id, reaction_roles=mappings)
+    await send_card(
+        interaction.response.send_message, "Reaction role added",
+        f"Reacting with {emoji} on [the message]({target_message.jump_url}) now grants {role.mention}.\n"
+        f"Removing the reaction revokes it.",
+        ephemeral=True,
+    )
+
+
+@reactionroles_group.command(name="remove", description="Remove one reaction-role mapping.")
+@app_commands.describe(message="Message ID or link used when the mapping was created", emoji="Emoji of the mapping")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def reactionroles_remove(interaction: discord.Interaction, message: str, emoji: str):
+    channel_id, message_id = _parse_message_ref(message)
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    mappings = list(config["reaction_roles"])
+    kept = [
+        entry for entry in mappings
+        if not (
+            (channel_id is None or str(entry.get("channel_id")) == str(channel_id))
+            and (message_id is None or str(entry.get("message_id")) == str(message_id))
+            and _emoji_matches(str(entry.get("emoji", "")), emoji)
+        )
+    ]
+    if len(kept) == len(mappings):
+        await send_card(
+            interaction.response.send_message, "Mapping not found",
+            f"No reaction-role mapping matches `{emoji}` on that message.",
+            error=True, ephemeral=True,
+        )
+        return
+    await mod_store.update_guild_config(interaction.guild_id, reaction_roles=kept)
+    await send_card(
+        interaction.response.send_message, "Reaction role removed",
+        f"Removed {len(mappings) - len(kept)} mapping(s) for `{emoji}` on that message.",
+        ephemeral=True,
+    )
+
+
+@reactionroles_group.command(name="list", description="Show this server's reaction-role mappings.")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def reactionroles_list(interaction: discord.Interaction):
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    mappings = config["reaction_roles"]
+    if not mappings:
+        await send_card(
+            interaction.response.send_message, "Reaction roles",
+            "No reaction-role mappings are configured yet. Create one with `/reactionroles add`.",
+            ephemeral=True,
+        )
+        return
+    lines = []
+    for index, entry in enumerate(mappings, start=1):
+        role = interaction.guild.get_role(int(entry["role_id"]))
+        role_text = role.mention if role else f"deleted role `{entry['role_id']}`"
+        channel = interaction.guild.get_channel(int(entry["channel_id"]))
+        channel_text = channel.mention if channel else f"channel `{entry['channel_id']}`"
+        lines.append(
+            f"{index}. {entry['emoji']} → {role_text} · {channel_text} · [message](https://discord.com/channels/"
+            f"{interaction.guild_id}/{entry['channel_id']}/{entry['message_id']})"
+        )
+    await send_card(
+        interaction.response.send_message, "Reaction roles",
+        "\n".join(lines), footer=f"{len(mappings)} mapping(s)", ephemeral=True,
+    )
+
+
 tree.add_command(automod_group)
 tree.add_command(raid_group)
 tree.add_command(config_group)
+tree.add_command(reactionroles_group)
 
 
 @tree.command(name="modlog", description="Set the channel moderation events get logged to.")
