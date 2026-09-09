@@ -44,7 +44,7 @@ load_dotenv()
 from response_cards import GREEN, ORANGE, send_card, send_production_card
 from wiki_cards import linked_wiki_card
 from response_cards import send_factory_plan
-from tools.factory_calculator import FactoryRequest, FactoryError, full_factory_request, parse_factory_request, plan_factory
+from tools.factory_calculator import FactoryRequest, FactoryError, full_factory_request, parse_factory_request, parse_recipe, plan_factory
 from knowledge.obsidian_vault import VaultError
 from reliability import timeout_seconds
 from observability import current_trace, mark_delivery, mark_status, trace_event, diagnostic_excerpt, configure_logging
@@ -864,6 +864,88 @@ async def wiki_status(interaction: discord.Interaction):
     )
 
 
+@tree.command(name="status", description="Check bot health, integrations, and setup completeness.")
+@app_commands.guild_only()
+@bot_admin_only()
+@bounded_command
+async def status(interaction: discord.Interaction):
+    """One actionable health card: gateway, wiki, market, keys, and guild setup."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    lines: list[str] = []
+    warnings = 0
+
+    def report(ok: bool, text: str, hint: str | None = None) -> None:
+        nonlocal warnings
+        if ok:
+            lines.append(f"✅ {text}")
+        else:
+            warnings += 1
+            lines.append(f"⚠️ {text}" + (f" — {hint}" if hint else ""))
+
+    latency_ms = round(client.latency * 1000) if client.latency else None
+    report(
+        latency_ms is not None and latency_ms < 1000,
+        f"Discord gateway: {latency_ms}ms heartbeat" if latency_ms is not None else "Discord gateway: no heartbeat yet",
+    )
+
+    try:
+        payload = json.loads(await capital_rift_wiki("status"))
+        data = payload.get("data", {})
+        if data.get("error"):
+            report(False, f"Capital Rift wiki: {data['error']}", "check CAPITAL_RIFT_VAULT_PATH in .env")
+        else:
+            report(True, f"Capital Rift wiki: {int(data.get('totalNotes', 0)):,} notes indexed")
+    except Exception as exc:
+        report(False, f"Capital Rift wiki: {type(exc).__name__}", "check CAPITAL_RIFT_VAULT_PATH in .env")
+
+    try:
+        companies = await market_client.get_companies()
+        report(True, f"Babylon market API: {len(companies):,} companies listed")
+    except BabylonAPIError as exc:
+        report(False, f"Babylon market API: {exc}", "market commands will degrade")
+
+    report(
+        bool(os.environ.get("NVIDIA_API_KEY", "").strip()),
+        "NVIDIA API key configured",
+        "AI chat and moderation need NVIDIA_API_KEY in .env",
+    )
+    report(
+        bool(os.environ.get("TAVILY_API_KEY", "").strip()),
+        "Tavily web search configured",
+        "optional; live web search needs TAVILY_API_KEY",
+    )
+
+    config = await mod_store.get_guild_config(interaction.guild_id)
+    report(
+        bool(config.get("setup_complete")),
+        "Server setup completed",
+        "run /setup to complete initial configuration",
+    )
+    report(
+        bool(config.get("admin_role_id")),
+        "Bot admin role selected",
+        "set one with /config admin-role",
+    )
+    report(
+        bool(config.get("market_channel_id")),
+        "Market channel selected",
+        "set one with /config market-channel",
+    )
+    report(
+        bool(config.get("mod_log_channel_id")),
+        "Moderation log channel selected",
+        "set one with /modlog",
+    )
+
+    await send_card(
+        interaction.followup.send, "Babylon Helper status",
+        "\n".join(lines),
+        accent=GREEN if warnings == 0 else ORANGE,
+        footer=f"{warnings} warning(s)" if warnings else "All systems nominal",
+        ephemeral=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Capital Rift direct wiki commands (no AI tool-calling required)
 # ---------------------------------------------------------------------------
@@ -901,30 +983,6 @@ async def _capital_rift_note(query: str, kind: str) -> tuple[dict | None, str | 
     if data.get("error"):
         return None, data["error"]
     return data, None
-
-
-def _per_minute_rate(note: str) -> float | None:
-    """Read an explicit output/recipe rate from common wiki Markdown formats."""
-    patterns = (
-        r"(?:recipe|output|production)\s*rate\s*[:|]\s*[* ]*([0-9]+(?:\.[0-9]+)?)\s*(?:/|\bper\s+)m(?:in(?:ute)?)?\b",
-        r"([0-9]+(?:\.[0-9]+)?)\s*(?:/|\bper\s+)m(?:in(?:ute)?)?\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, note, flags=re.IGNORECASE)
-        if match:
-            rate = float(match.group(1))
-            if rate > 0:
-                return rate
-    return None
-
-
-def _machine_name(note: str) -> str | None:
-    match = re.search(
-        r"(?:machine|building|produced\s+by)\s*[:|]\s*[* ]*([^\n|*]+)",
-        note,
-        flags=re.IGNORECASE,
-    )
-    return match.group(1).strip(" .:-") if match else None
 
 
 @tree.command(name="item", description="Look up a Capital Rift item in the local wiki.")
@@ -984,7 +1042,7 @@ async def factory(
 
 @tree.command(name="production", description="Calculate machines required for a Capital Rift output target.")
 @app_commands.describe(
-    item="Output item or recipe name, for example Iron Plate",
+    item="Exact output item name, for example Iron Plate (autocompletes from the wiki)",
     target_per_minute="Desired output per minute",
 )
 @bounded_command
@@ -992,22 +1050,29 @@ async def production(interaction: discord.Interaction, item: str, target_per_min
     await interaction.response.defer(thinking=True)
     note, error = await _capital_rift_note(item, "recipe")
     if error:
-        await send_card(interaction.followup.send, "Recipe unavailable", error, error=True, ephemeral=True)
-        return
-
-    rate = _per_minute_rate(note.get("content", ""))
-    if rate is None:
         await send_card(
-            interaction.followup.send, "Rate unavailable",
-            "I found the recipe, but its wiki note does not contain an explicit per-minute output rate, "
-            f"so I will not guess the machine count. Source: {note.get('path', 'unknown')}",
+            interaction.followup.send, "Recipe unavailable",
+            f"{error}\n\nUse the exact item name — the `item` field autocompletes indexed wiki names.",
             error=True, ephemeral=True,
         )
         return
 
-    machines = int(math.ceil(float(target_per_minute) / rate))
-    machine = _machine_name(note.get("content", "")) or "the recipe machine"
+    recipe = parse_recipe(note)
+    if recipe.rate is None:
+        details = "\n".join(f"- {issue}" for issue in recipe.issues) or \
+            "- The wiki note does not publish a per-minute output rate."
+        await send_card(
+            interaction.followup.send, "Rate unavailable",
+            f"I found the recipe, but its wiki data is incomplete, so I will not guess the machine count:\n"
+            f"{details}\n\nSource: {note.get('path', 'unknown')}",
+            error=True, ephemeral=True,
+        )
+        return
+
+    rate = float(recipe.rate)
+    machines = max(1, math.ceil(float(target_per_minute) / rate))
     actual_output = machines * rate
+    machine = recipe.machine or "the recipe machine"
     body = (
         f"Target: **{float(target_per_minute):g}/min**\n"
         f"Recipe rate: **{rate:g}/min per machine**\n"
@@ -1015,9 +1080,27 @@ async def production(interaction: discord.Interaction, item: str, target_per_min
         f"Output at full capacity: **{actual_output:g}/min**"
     )
     await send_card(
-        interaction.followup.send, f"Production plan · {note.get('title', item)}", body,
+        interaction.followup.send, f"Production plan · {recipe.name}", body,
         accent=GREEN, footer=f"Capital Rift wiki · Source: {note.get('path', 'unknown')}",
     )
+
+
+@production.autocomplete("item")
+async def production_item_autocomplete(
+    _interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if not current.strip():
+        return []
+    try:
+        payload = json.loads(await capital_rift_wiki("search", query=current, limit=10))
+    except Exception:
+        return []
+    titles = [item.get("title", "").strip() for item in payload.get("data", {}).get("results") or []]
+    return [
+        app_commands.Choice(name=title[:100], value=title[:100])
+        for title in titles
+        if title
+    ][:10]
 
 
 @tree.error

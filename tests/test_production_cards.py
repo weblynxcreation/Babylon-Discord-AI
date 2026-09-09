@@ -80,3 +80,106 @@ placement: Stands on a table-height surface
         self.assertIn("Storage details are not stated in the retrieved wiki.", text)
         self.assertNotIn("Stands on a table-height surface", text)
         self.assertNotIn("[machine] -> [output]", text)
+
+class ProductionCommandTests(unittest.IsolatedAsyncioTestCase):
+    def _interaction(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        return SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _note(self, *, with_rate=True):
+        rate = "recipe_rate_per_minute: 2" if with_rate else ""
+        return {
+            "title": "Iron Plate",
+            "path": "Wiki/Items/Iron Plate.md",
+            "content": (
+                "---\nname: Iron Plate\nsource: https://wiki.capitalrift.com/items/iron-plate/\n"
+                f"recipe_machine: [[Furnace]]\nrecipe_output_quantity: 1\n{rate}\n---\n"
+                "## Recipe\n#### Ingredients\n| Quantity | Item |\n|---|---|\n| 2 | [[Iron Ore]] |\n"
+            ),
+        }
+
+    async def test_production_uses_parsed_recipe_for_machine_count(self):
+        from unittest.mock import AsyncMock, patch
+        import bot
+        interaction = self._interaction()
+        with patch("bot._capital_rift_note", AsyncMock(return_value=(self._note(), None))):
+            await bot.production.callback(interaction, "Iron Plate", 10.0)
+        interaction.response.defer.assert_awaited_once()
+        kwargs = interaction.followup.send.call_args.kwargs
+        view = kwargs["view"]
+        body = next(c["content"] for c in view.to_components()[0]["components"] if c.get("type") == 10 and "Machines needed" in c.get("content", ""))
+        self.assertIn("5 Furnace", body)
+        self.assertIn("10/min", body)
+
+    async def test_production_missing_rate_reports_recipe_issues(self):
+        from unittest.mock import AsyncMock, patch
+        import bot
+        interaction = self._interaction()
+        with patch("bot._capital_rift_note", AsyncMock(return_value=(self._note(with_rate=False), None))):
+            await bot.production.callback(interaction, "Iron Plate", 10.0)
+        kwargs = interaction.followup.send.call_args.kwargs
+        self.assertTrue(kwargs.get("ephemeral"))
+        self.assertEqual(kwargs["view"].to_components()[0]["accent_color"], 0xE74C3C)
+
+    async def test_production_autocompletes_indexed_titles(self):
+        import json
+        from unittest.mock import AsyncMock, patch
+        import bot
+        search = AsyncMock(return_value=json.dumps(
+            {"data": {"results": [{"title": "Iron Plate", "path": "a.md"}, {"title": "Iron Ore", "path": "b.md"}]}}
+        ))
+        with patch("bot.capital_rift_wiki", search):
+            choices = await bot.production_item_autocomplete(None, "iron")
+        self.assertEqual([choice.value for choice in choices], ["Iron Plate", "Iron Ore"])
+
+
+class StatusCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_status_card_is_green_when_everything_is_configured(self):
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        import bot
+        config = {
+            "setup_complete": True, "admin_role_id": 1, "market_channel_id": 2,
+            "mod_log_channel_id": 3,
+        }
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        wiki = AsyncMock(return_value=json.dumps({"data": {"totalNotes": 120}}))
+        with patch("bot.capital_rift_wiki", wiki), \
+             patch.object(bot.market_client, "get_companies", AsyncMock(return_value=[object()] * 4)), \
+             patch.object(bot.client, "ws", __import__("types").SimpleNamespace(latency=0.12)), \
+             patch.object(bot.mod_store, "get_guild_config", AsyncMock(return_value=config)), \
+             patch.dict(__import__('os').environ, {"NVIDIA_API_KEY": "k", "TAVILY_API_KEY": "k"}, clear=False):
+            await bot.status.callback(interaction)
+        kwargs = interaction.followup.send.call_args.kwargs
+        self.assertEqual(kwargs["view"].to_components()[0]["accent_color"], 0x2ECC71)
+        self.assertTrue(kwargs.get("ephemeral"))
+
+    async def test_status_card_flags_market_and_setup_warnings(self):
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        import bot
+        from babylon_market import BabylonAPIError
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        wiki = AsyncMock(return_value=json.dumps({"data": {"totalNotes": 120}}))
+        with patch("bot.capital_rift_wiki", wiki), \
+             patch.object(bot.market_client, "get_companies", AsyncMock(side_effect=BabylonAPIError("offline"))), \
+             patch.object(bot.client, "ws", __import__("types").SimpleNamespace(latency=0.12)), \
+             patch.object(bot.mod_store, "get_guild_config", AsyncMock(return_value={})), \
+             patch.dict(__import__('os').environ, {"NVIDIA_API_KEY": "k"}, clear=False):
+            await bot.status.callback(interaction)
+        kwargs = interaction.followup.send.call_args.kwargs
+        self.assertEqual(kwargs["view"].to_components()[0]["accent_color"], 0xE67E22)
