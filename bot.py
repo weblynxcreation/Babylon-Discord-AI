@@ -253,19 +253,51 @@ def _build_policy_card(config: dict, guild_id: int):
 
 
 async def _maybe_send_policy_card(member: discord.Member) -> None:
-    """DM the acceptance card on join when enabled and not yet accepted."""
+    """Gate new members behind policy acceptance, then DM the acceptance card."""
     try:
         config = await mod_store.get_guild_config(member.guild.id)
     except Exception:
         log.exception("Policy config lookup failed for guild %s", member.guild.id)
         return
-    if not config.get("policy_enabled") or str(member.id) in config.get("policy_acceptances", {}):
+    if not config.get("policy_enabled"):
+        return
+    accepted = str(member.id) in config.get("policy_acceptances", {})
+    await _apply_policy_gate(member, config, accepted=accepted)
+    if accepted:
         return
     try:
         await member.send(view=_build_policy_card(config, member.guild.id))
     except discord.HTTPException:
         # Closed DMs are expected; staff can re-send via /policy resend.
         log.info("[policy:%s] Could not DM acceptance card to %s", member.guild.id, member.id)
+
+
+async def _apply_policy_gate(member: discord.Member, config: dict, *, accepted: bool) -> None:
+    """Idempotently enforce the hold/member roles for one member.
+
+    Roles missing, deleted, or at/above the bot's top role are skipped with a
+    staff-visible note; acceptance state itself is never blocked by role issues.
+    """
+    guild = member.guild
+    hold = guild.get_role(config.get("policy_hold_role_id") or 0)
+    member_role = guild.get_role(config.get("policy_member_role_id") or 0)
+    if hold is not None and _reaction_role_issues(hold, guild.me):
+        await _mod_log(guild, f"⚠️ Policy hold role {hold.name} is not manageable by me; check role hierarchy.")
+        hold = None
+    if member_role is not None and _reaction_role_issues(member_role, guild.me):
+        await _mod_log(guild, f"⚠️ Policy member role {member_role.name} is not manageable by me; check role hierarchy.")
+        member_role = None
+    try:
+        if not accepted:
+            if hold is not None and hold not in member.roles:
+                await member.add_roles(hold, reason="Policy acceptance pending")
+        else:
+            if hold is not None and hold in member.roles:
+                await member.remove_roles(hold, reason="Policy accepted")
+            if member_role is not None and member_role not in member.roles:
+                await member.add_roles(member_role, reason="Policy accepted")
+    except discord.HTTPException:
+        await _mod_log(guild, f"⚠️ Could not update policy roles for {member.mention} (permissions?).")
 
 
 async def record_policy_acceptance(guild_id: int, user_id: int, *, via: str) -> str:
@@ -292,6 +324,18 @@ async def on_interaction(interaction: discord.Interaction):
     except ValueError:
         return
     accepted_at = await record_policy_acceptance(guild_id, interaction.user.id, via="dm-button")
+    # Open the gate: swap hold role for member role. DM interactions carry a
+    # User, not a Member, so resolve the member through the guild.
+    guild = client.get_guild(guild_id)
+    member = None
+    if guild is not None:
+        try:
+            member = guild.get_member(interaction.user.id) or await guild.fetch_member(interaction.user.id)
+        except discord.HTTPException:
+            member = None
+    if member is not None:
+        config = await mod_store.get_guild_config(guild_id)
+        await _apply_policy_gate(member, config, accepted=True)
     await interaction.response.send_message(
         f"Accepted ✓ — recorded <t:{int(datetime.fromisoformat(accepted_at).timestamp())}:f>. "
         "Welcome aboard! Staff can verify this anytime.",
@@ -321,13 +365,63 @@ async def policy_enable(
     if terms_url:
         updates["policy_terms_url"] = terms_url
     config = await mod_store.update_guild_config(interaction.guild_id, **updates)
+    await _send_policy_gate_summary(
+        interaction, config,
+        prefix="Policy acceptance enabled. New members must accept before using the server.",
+    )
+
+
+@policy_group.command(name="set-roles", description="Set the roles that gate the server until acceptance.")
+@app_commands.describe(
+    hold_role="Role assigned on join that blocks server access (create it with denied view permissions)",
+    member_role="Role granted once the policies are accepted",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@bounded_command
+async def policy_set_roles(
+    interaction: discord.Interaction,
+    hold_role: discord.Role | None = None,
+    member_role: discord.Role | None = None,
+):
+    if hold_role is None and member_role is None:
+        await send_card(
+            interaction.response.send_message, "No roles given",
+            "Pass `hold_role` and/or `member_role`. Both must be below my highest role.",
+            error=True, ephemeral=True,
+        )
+        return
+    updates = {}
+    for role, key, label in ((hold_role, "policy_hold_role_id", "hold"), (member_role, "policy_member_role_id", "member")):
+        if role is None:
+            continue
+        issues = _reaction_role_issues(role, interaction.guild.me)
+        if issues:
+            await send_card(
+                interaction.response.send_message, f"{label.capitalize()} role not usable",
+                "\n".join(f"- {issue}" for issue in issues), error=True, ephemeral=True,
+            )
+            return
+        updates[key] = role.id
+    config = await mod_store.update_guild_config(interaction.guild_id, **updates)
+    await _send_policy_gate_summary(interaction, config, prefix="Policy gate roles updated.")
+
+
+async def _send_policy_gate_summary(interaction: discord.Interaction, config: dict, *, prefix: str):
+    hold = interaction.guild.get_role(config.get("policy_hold_role_id") or 0)
+    member_role = interaction.guild.get_role(config.get("policy_member_role_id") or 0)
+    hold_text = hold.mention if hold else "not set — joiners are only DM'd the card"
+    member_text = member_role.mention if member_role else "not set — acceptance only removes the hold role"
     await send_card(
-        interaction.response.send_message, "Policy acceptance enabled",
-        f"New members will be DM'd the acceptance card on join.\n\n"
-        f"- [Privacy Policy]({config['policy_privacy_url']})\n"
-        f"- [Terms of Service]({config['policy_terms_url']})\n\n"
-        f"Re-send it to existing members with `/policy resend`.",
-        accent=GREEN, ephemeral=True,
+        interaction.response.send_message, "Policy acceptance gate",
+        f"{prefix}\n\n"
+        f"**Hold role (blocks access until accepted):** {hold_text}\n"
+        f"**Member role (granted on acceptance):** {member_text}\n\n"
+        f"Lock your channels by denying **View Channel** to the hold role"
+        + (f" (or grant it only to {member_role.mention})" if member_role else "")
+        + ". New joins get the hold role until they press **I accept**.",
+        accent=GREEN if config.get("policy_enabled") else None,
+        ephemeral=True,
     )
 
 
@@ -351,9 +445,13 @@ async def policy_disable(interaction: discord.Interaction):
 async def policy_status(interaction: discord.Interaction):
     config = await mod_store.get_guild_config(interaction.guild_id)
     accepted = len(config.get("policy_acceptances", {}))
+    hold = interaction.guild.get_role(config.get("policy_hold_role_id") or 0)
+    member_role = interaction.guild.get_role(config.get("policy_member_role_id") or 0)
     await send_card(
         interaction.response.send_message, "Policy acceptance",
         f"**Status:** {'Enabled' if config['policy_enabled'] else 'Disabled'}\n"
+        f"**Hold role:** {hold.mention if hold else 'not set'}\n"
+        f"**Member role:** {member_role.mention if member_role else 'not set'}\n"
         f"**Accepted:** {accepted:,} member(s)\n\n"
         f"- [Privacy Policy]({config['policy_privacy_url']})\n"
         f"- [Terms of Service]({config['policy_terms_url']})",

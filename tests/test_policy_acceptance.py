@@ -8,10 +8,19 @@ from unittest.mock import AsyncMock, patch
 from moderation import store
 
 
-def make_member(member_id=500, *, dm_fails=False, guild_id=900):
+def make_member(member_id=500, *, dm_fails=False, guild_id=900, roles=()):
     member = SimpleNamespace(
-        id=member_id, bot=False, guild=SimpleNamespace(id=guild_id),
+        id=member_id, bot=False,
+        guild=SimpleNamespace(
+            id=guild_id, get_role=lambda _role_id: None,
+            me=SimpleNamespace(
+                top_role=SimpleNamespace(name="BotTop", position=10),
+                guild_permissions=SimpleNamespace(manage_roles=True),
+            ),
+        ),
+        roles=list(roles),
         send=AsyncMock(),
+        add_roles=AsyncMock(), remove_roles=AsyncMock(),
     )
     if dm_fails:
         import discord
@@ -24,6 +33,27 @@ def make_member(member_id=500, *, dm_fails=False, guild_id=900):
 
         member.send = fail
     return member
+
+
+def make_gate_roles(guild_id=900, *, hold_position=1, member_position=2):
+    hold = SimpleNamespace(
+        id=111, name="Pending", managed=False, is_default=lambda: False,
+        position=hold_position,
+    )
+    member_role = SimpleNamespace(
+        id=222, name="Member", managed=False, is_default=lambda: False,
+        position=member_position,
+    )
+    me = SimpleNamespace(
+        top_role=SimpleNamespace(name="BotTop", position=10),
+        guild_permissions=SimpleNamespace(manage_roles=True),
+    )
+    roles_by_id = {111: hold, 222: member_role}
+    guild = SimpleNamespace(
+        id=guild_id, me=me,
+        get_role=lambda role_id: roles_by_id.get(role_id),
+    )
+    return hold, member_role, guild
 
 
 class PolicyStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -75,7 +105,8 @@ class PolicyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         member = make_member()
         enabled = {"policy_enabled": True, "policy_acceptances": {},
                    "policy_privacy_url": "https://holdings.thebabylon.hu/privacy",
-                   "policy_terms_url": "https://holdings.thebabylon.hu/terms"}
+                   "policy_terms_url": "https://holdings.thebabylon.hu/terms",
+                   "policy_hold_role_id": None, "policy_member_role_id": None}
         with patch.object(self.bot.raid, "handle_join", AsyncMock()), \
              patch.object(self.bot.mod_store, "get_guild_config", AsyncMock(return_value=enabled)):
             await self.bot.on_member_join(member)
@@ -97,6 +128,60 @@ class PolicyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.bot.mod_store, "get_guild_config", AsyncMock(return_value=dict(enabled, policy_enabled=False))):
             await self.bot.on_member_join(member)
         member.send.assert_not_awaited()
+
+    async def test_join_assigns_hold_role_until_accepted(self):
+        hold, member_role, guild = make_gate_roles()
+        member = make_member(roles=[])
+        member.guild = guild
+        config = {"policy_enabled": True, "policy_acceptances": {},
+                  "policy_privacy_url": "https://holdings.thebabylon.hu/privacy",
+                  "policy_terms_url": "https://holdings.thebabylon.hu/terms",
+                  "policy_hold_role_id": 111, "policy_member_role_id": 222}
+        with patch.object(self.bot.raid, "handle_join", AsyncMock()), \
+             patch.object(self.bot.mod_store, "get_guild_config", AsyncMock(return_value=config)):
+            await self.bot.on_member_join(member)
+        member.add_roles.assert_awaited_once_with(hold, reason="Policy acceptance pending")
+        member.send.assert_awaited_once()
+
+    async def test_acceptance_swaps_hold_for_member_role(self):
+        hold, member_role, guild = make_gate_roles()
+        member = make_member(roles=[hold])
+        member.guild = guild
+        config = {"policy_enabled": True,
+                  "policy_acceptances": {"500": {"accepted_at": "2026-09-09T00:00:00+00:00", "via": "dm-button"}},
+                  "policy_privacy_url": "x", "policy_terms_url": "y",
+                  "policy_hold_role_id": 111, "policy_member_role_id": 222}
+        await self.bot._apply_policy_gate(member, config, accepted=True)
+        member.remove_roles.assert_awaited_once_with(hold, reason="Policy accepted")
+        member.add_roles.assert_awaited_once_with(member_role, reason="Policy accepted")
+        member.send.assert_not_awaited()
+
+    async def test_repeat_join_of_accepted_member_grants_member_role(self):
+        hold, member_role, guild = make_gate_roles()
+        member = make_member(roles=[])
+        member.guild = guild
+        config = {"policy_enabled": True,
+                  "policy_acceptances": {"500": {"accepted_at": "2026-09-09T00:00:00+00:00", "via": "dm-button"}},
+                  "policy_privacy_url": "x", "policy_terms_url": "y",
+                  "policy_hold_role_id": 111, "policy_member_role_id": 222}
+        with patch.object(self.bot.raid, "handle_join", AsyncMock()), \
+             patch.object(self.bot.mod_store, "get_guild_config", AsyncMock(return_value=config)):
+            await self.bot.on_member_join(member)
+        member.add_roles.assert_awaited_once_with(member_role, reason="Policy accepted")
+        member.send.assert_not_awaited()
+
+    async def test_unsafe_gate_roles_are_skipped_without_blocking(self):
+        # Both roles above the bot's top role: nothing is assigned, nothing raises.
+        hold, member_role, guild = make_gate_roles(hold_position=50, member_position=60)
+        member = make_member(roles=[])
+        member.guild = guild
+        config = {"policy_enabled": True, "policy_acceptances": {},
+                  "policy_privacy_url": "x", "policy_terms_url": "y",
+                  "policy_hold_role_id": 111, "policy_member_role_id": 222}
+        with patch.object(self.bot, "_mod_log", AsyncMock()) as mod_log:
+            await self.bot._apply_policy_gate(member, config, accepted=False)
+        member.add_roles.assert_not_awaited()
+        self.assertEqual(mod_log.await_count, 2)  # one staff note per unusable role
 
     async def test_closed_dms_fail_gracefully(self):
         member = make_member(dm_fails=True)
@@ -121,6 +206,31 @@ class PolicyAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         record.assert_awaited_once_with(900, 500, via="dm-button")
         interaction.response.send_message.assert_awaited_once()
         self.assertTrue(interaction.response.send_message.await_args.kwargs.get("ephemeral"))
+
+    async def test_component_click_opens_the_gate(self):
+        import discord
+
+        hold, member_role, guild = make_gate_roles()
+        member = make_member(roles=[hold])
+        member.guild = guild
+        guild.get_member = lambda _id: member
+        guild.fetch_member = AsyncMock(return_value=member)
+        interaction = SimpleNamespace(
+            type=discord.InteractionType.component,
+            data={"custom_id": "policy:accept:900"},
+            user=SimpleNamespace(id=500),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+        config = {"policy_enabled": True, "policy_acceptances": {},
+                  "policy_privacy_url": "x", "policy_terms_url": "y",
+                  "policy_hold_role_id": 111, "policy_member_role_id": 222}
+        with patch.object(self.bot, "record_policy_acceptance", AsyncMock(return_value="2026-09-09T00:00:00+00:00")), \
+             patch.object(self.bot.client, "get_guild", lambda _id: guild), \
+             patch.object(self.bot.mod_store, "get_guild_config", AsyncMock(return_value=config)):
+            await self.bot.on_interaction(interaction)
+        member.remove_roles.assert_awaited_once_with(hold, reason="Policy accepted")
+        member.add_roles.assert_awaited_once_with(member_role, reason="Policy accepted")
+        interaction.response.send_message.assert_awaited_once()
 
     async def test_unrelated_interactions_are_ignored(self):
         import discord

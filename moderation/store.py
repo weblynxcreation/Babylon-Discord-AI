@@ -37,6 +37,9 @@ DEFAULT_GUILD_CONFIG = {
     "policy_enabled": False,
     "policy_privacy_url": "https://holdings.thebabylon.hu/privacy",
     "policy_terms_url": "https://holdings.thebabylon.hu/terms",
+    # Roles enforcing the gate; both must sit below the bot's top role.
+    "policy_hold_role_id": None,
+    "policy_member_role_id": None,
     # {user_id_str: {"accepted_at": iso8601, "via": "dm-button"}}
     "policy_acceptances": {},
 }
